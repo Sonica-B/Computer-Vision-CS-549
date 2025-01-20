@@ -27,23 +27,41 @@ def main():
     Parser.add_argument('--NumFeatures', default=1000, help='Number of best features to extract from each image, Default:100')
     Parser.add_argument('--folder', default='../Data/Train/Set2', help='Path to image folder')
     Args = Parser.parse_args()
-    NumFeatures = Args.NumFeatures
+    NumFeatures = int(Args.NumFeatures)
     folder_path = Args.folder
+
+    # Check for CUDA availability
+    if cv2.cuda.getCudaEnabledDeviceCount() > 0:
+        print("CUDA device found! Using GPU acceleration")
+        use_gpu = True
+    else:
+        print("No CUDA device found. Using CPU")
+        use_gpu = False
 
     """
     Read a set of images for Panorama stitching
     """
 
+    print("\nReading images...")
     images = []
     image_files = sorted([f for f in os.listdir(folder_path) if f.endswith('.jpg')])
     for f in image_files:
+        print(f"Reading {f}")
         img = cv2.imread(os.path.join(folder_path, f))
         if img is not None:
-            images.append(img)
+            if use_gpu:
+                # Upload to GPU memory
+                gpu_img = cv2.cuda_GpuMat()
+                gpu_img.upload(img)
+                images.append(gpu_img)
+            else:
+                images.append(img)
 
     if len(images) < 3:
         print("Need at least 3 images")
         return
+
+    print(f"\nProcessing first image...")
 
     """
 	Corner Detection
@@ -52,48 +70,45 @@ def main():
 
     def detect_corners(img):
         """
-        Detect corners using either Harris corners or Shi-Tomasi
-
+        Detect corners using Harris corners
         Args:
             img: Input image
-
         Returns:
             C_img: Corner response image from cornermetric
-            corners: Detected corner coordinates
+            corners: Corner coordinates
             scores: Corner response scores
         """
         # Convert to grayscale
         gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+        gray = np.float32(gray)
 
-        # Method 1: Harris Corner Detector
-        # Compute corner response image
+        # Compute Harris corner response image
         C_img = cv2.cornerHarris(gray, blockSize=2, ksize=3, k=0.04)
 
-        # Alternative Method 2: Shi-Tomasi
-        # corners = cv2.goodFeaturesToTrack(gray, maxCorners=1000,
-        #                                  qualityLevel=0.01, minDistance=10)
+        # Normalize corner response
+        C_img_norm = cv2.normalize(C_img, None, alpha=0, beta=1, norm_type=cv2.NORM_MINMAX)
 
         # Find local maxima
         corners = []
         scores = []
 
         # Pad the corner response image to handle boundaries
-        padded = np.pad(C_img, ((1, 1), (1, 1)), mode='constant')
+        padded = np.pad(C_img_norm, ((1, 1), (1, 1)), mode='constant')
 
         # Find local maxima
-        for i in range(1, C_img.shape[0] + 1):
-            for j in range(1, C_img.shape[1] + 1):
+        for i in range(1, C_img_norm.shape[0] + 1):
+            for j in range(1, C_img_norm.shape[1] + 1):
                 # 3x3 window for local maximum check
                 window = padded[i - 1:i + 2, j - 1:j + 2]
                 center = window[1, 1]
 
                 # Check if center is local maximum and above threshold
-                if center > 0.01 * C_img.max() and center == np.max(window):
+                if center > 0.01 * C_img_norm.max() and center == np.max(window):
                     # Note: x=j-1, y=i-1 to convert back to image coordinates
-                    corners.append([j - 1, i - 1])
+                    corners.append([j - 1, i - 1])  # Store as [x,y]
                     scores.append(center)
 
-        return C_img, np.array(corners), np.array(scores)
+        return C_img_norm, np.array(corners), np.array(scores)
 
     """
 	Perform ANMS: Adaptive Non-Maximal Suppression
@@ -103,85 +118,89 @@ def main():
     def adaptiveNonMaximalSuppression(C_img, N_best):
         """
         Implement ANMS as specified in the algorithm
-
         Args:
             C_img: Corner score image (obtained using cornermetric)
             N_best: Number of best corners needed
-
         Returns:
             Array of (x_i, y_i) coordinates for i = 1:N_best
         """
-        # Find all local maxima using imregionalmax
+        # Find all local maxima
+        h, w = C_img.shape
         local_maxima = []
         scores = []
 
-        # Pad the corner response image
-        padded = np.pad(C_img, ((1, 1), (1, 1)), mode='constant')
+        for i in range(1, h - 1):
+            for j in range(1, w - 1):
+                # Get 3x3 window
+                window = C_img[i - 1:i + 2, j - 1:j + 2]
+                center = C_img[i, j]
 
-        # Find all local maxima
-        for i in range(1, C_img.shape[0] + 1):
-            for j in range(1, C_img.shape[1] + 1):
-                window = padded[i - 1:i + 2, j - 1:j + 2]
-                center = window[1, 1]
-
+                # Check if local maximum
                 if center == np.max(window) and center > 0:
-                    # Store [j-1, i-1] as x=j-1, y=i-1 are the image coordinates
-                    local_maxima.append([j - 1, i - 1])
+                    # Store [j,i] as [x,y] coordinates
+                    local_maxima.append([j, i])  # x=j, y=i
                     scores.append(center)
 
         local_maxima = np.array(local_maxima)
         N_strong = len(local_maxima)
 
-        if N_strong == 0:
-            return np.array([])
+        if N_strong < 4:  # Need at least 4 corners for homography
+            return local_maxima
 
         # Initialize r_i = infinity for i = [1:N_strong]
         r = np.full(N_strong, np.inf)
 
         # For each corner
         for i in range(N_strong):
-            # Get coordinates of current corner
-            y_i, x_i = local_maxima[i]  # Note: these are already in image coordinates
+            x_i, y_i = local_maxima[i]
 
             # Compare with all other corners
             for j in range(N_strong):
-                y_j, x_j = local_maxima[j]
+                if i == j:  # Skip self-comparison
+                    continue
 
-                # Check if corner j has higher corner response
+                x_j, y_j = local_maxima[j]
+
+                # Compare corner responses
                 if C_img[y_j, x_j] > C_img[y_i, x_i]:
                     # Calculate Euclidean distance
                     ED = (x_j - x_i) ** 2 + (y_j - y_i) ** 2
-
                     # Update r_i if necessary
-                    if ED < r[i]:
-                        r[i] = ED
+                    r[i] = min(r[i], ED)
 
         # Sort r_i in descending order and pick top N_best points
-        idx = np.argsort(r)[::-1]  # Sort in descending order
-        idx = idx[:min(N_best, len(idx))]  # Take top N_best points
+        idx = np.argsort(r)[::-1]
+        idx = idx[:min(N_best, N_strong)]
 
-        # Return coordinates in (x_i, y_i) format
-        return np.array([[local_maxima[i][1], local_maxima[i][0]] for i in idx])
+        return local_maxima[idx]
 
     """
 	Feature Descriptors
 	Save Feature Descriptor output as FD.png
 	"""
+
     def extract_features(img, corners):
         """
         Extract feature descriptors
+        Args:
+            img: Input image
+            corners: Corner points
+        Returns:
+            descriptors: Feature descriptors
+            valid_corners: Valid corner points
         """
         gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
         descriptors = []
         valid_corners = []
 
         for x, y in corners:
-            # Extract 41x41 patch centered at corner
+            # Check bounds for 41x41 patch
             x, y = int(x), int(y)
             if y - 20 < 0 or y + 21 > gray.shape[0] or x - 20 < 0 or x + 21 > gray.shape[1]:
                 continue
 
-            patch = gray[y - 20:y + 21, x - 20:x + 21]  # 41x41 patch
+            # Extract 41x41 patch
+            patch = gray[y - 20:y + 21, x - 20:x + 21]
 
             # Apply Gaussian blur
             patch = cv2.GaussianBlur(patch, (3, 3), 0)
@@ -189,7 +208,7 @@ def main():
             # Subsample to 8x8
             patch = cv2.resize(patch, (8, 8))
 
-            # Reshape to 64x1 and standardize
+            # Normalize descriptor
             feat = patch.reshape(64)
             feat = (feat - feat.mean()) / (feat.std() + 1e-7)
 
@@ -210,7 +229,7 @@ def main():
         matches = []
 
         for i, desc in enumerate(desc1):
-            # Compute distances to all descriptors in desc2
+            # Compute SSD with all descriptors in desc2
             dists = np.sum((desc2 - desc) ** 2, axis=1)
 
             # Find best and second best matches
@@ -231,29 +250,19 @@ def main():
 	Refine: RANSAC, Estimate Homography
 	"""
 
-    def ransac_homography(matches, threshold=5.0, N_max=1000):
+    def ransac_homography(matches, threshold=5.0, max_iters=1000):
         """
-        Estimate homography using RANSAC following the specified steps:
+        Estimate homography using RANSAC following the steps:
         1. Select four feature pairs (at random)
         2. Compute homography H between these pairs
         3. Compute inliers using SSD < τ
-        4. Repeat until N_max iterations or >90% inliers found
+        4. Repeat until max_iters or >90% inliers found
         5. Keep largest set of inliers
         6. Re-compute least-squares H estimate on all inliers
-
-        Args:
-            matches: Nx2x2 array of matching point pairs
-            threshold: τ for SSD threshold
-            N_max: Maximum number of iterations
-
-        Returns:
-            H: 3x3 homography matrix
-            mask: Boolean array indicating inliers
         """
         if len(matches) < 4:
             return None, None
 
-        # Convert matches to separate source and destination points
         p = np.float32(matches[:, 0])  # p_i from image 1
         p_prime = np.float32(matches[:, 1])  # p'_i from image 2
 
@@ -261,47 +270,41 @@ def main():
         best_mask = None
         best_inliers = 0
 
-        for _ in range(N_max):
-            # 1. Select four feature pairs at random
+        for _ in range(max_iters):
+            # 1. Select four feature pairs
             idx = np.random.choice(len(matches), 4, replace=False)
             src_pts = p[idx].reshape(-1, 1, 2)
             dst_pts = p_prime[idx].reshape(-1, 1, 2)
 
-            # 2. Compute homography H between point pairs
-            H, _ = cv2.findHomography(src_pts, dst_pts)
+            # 2. Compute homography
+            H = cv2.findHomography(src_pts, dst_pts)[0]
             if H is None:
                 continue
 
             # 3. Compute SSD for all points
-            p_transformed = cv2.perspectiveTransform(p.reshape(-1, 1, 2), H)
-            if p_transformed is None:
+            transformed = cv2.perspectiveTransform(p.reshape(-1, 1, 2), H)
+            if transformed is None:
                 continue
 
-            # Calculate SSD (sum of squared differences)
-            ssd = np.sum((p_prime.reshape(-1, 1, 2) - p_transformed) ** 2, axis=(1, 2))
-
-            # Find inliers where SSD < τ
+            # SSD calculation
+            ssd = np.sum((p_prime.reshape(-1, 1, 2) - transformed) ** 2, axis=(1, 2))
             mask = ssd < threshold
-            num_inliers = np.sum(mask)
+            inliers = np.sum(mask)
 
-            # Update best result if we found more inliers
-            if num_inliers > best_inliers:
-                best_inliers = num_inliers
+            if inliers > best_inliers:
+                best_inliers = inliers
                 best_H = H
                 best_mask = mask
 
-            # 4. Early termination if we found more than 90% inliers
+            # Check for 90% inliers
             if best_inliers > len(p) * 0.9:
                 break
 
-        # 5. Keep largest set of inliers
-        if best_mask is None or np.sum(best_mask) < 4:
-            return None, None
-
-        # 6. Re-compute least-squares H estimate on all inliers
-        src_pts_inliers = p[best_mask].reshape(-1, 1, 2)
-        dst_pts_inliers = p_prime[best_mask].reshape(-1, 1, 2)
-        best_H, _ = cv2.findHomography(src_pts_inliers, dst_pts_inliers, method=cv2.RANSAC)
+        # 5-6. Use largest inlier set to recompute H
+        if best_mask is not None and np.sum(best_mask) >= 4:
+            src_pts = p[best_mask].reshape(-1, 1, 2)
+            dst_pts = p_prime[best_mask].reshape(-1, 1, 2)
+            best_H = cv2.findHomography(src_pts, dst_pts)[0]
 
         return best_H, best_mask
 
@@ -310,14 +313,18 @@ def main():
 	Save Panorama output as mypano.png
 	"""
 
-
     def blend_images(img1, img2, H):
         """
         Blend images using homography
         """
-        # Find panorama dimensions
+        # Convert H to float32
+        H = H.astype(np.float32)
+
+        # Get dimensions
         h1, w1 = img1.shape[:2]
         h2, w2 = img2.shape[:2]
+
+        # Transform corners
         corners1 = np.float32([[0, 0], [w1, 0], [w1, h1], [0, h1]]).reshape(-1, 1, 2)
         corners2 = cv2.perspectiveTransform(corners1, H)
         corners = np.concatenate((corners2, np.float32([[0, 0], [w2, 0], [w2, h2], [0, h2]]).reshape(-1, 1, 2)))
@@ -327,116 +334,142 @@ def main():
 
         # Translation matrix
         t = [-xmin, -ymin]
-        Ht = np.array([[1, 0, t[0]], [0, 1, t[1]], [0, 0, 1]])
+        Ht = np.array([[1, 0, t[0]], [0, 1, t[1]], [0, 0, 1]], dtype=np.float32)
 
         # Warp images
         warped1 = cv2.warpPerspective(img1, Ht @ H, (xmax - xmin, ymax - ymin))
         warped2 = cv2.warpPerspective(img2, Ht, (xmax - xmin, ymax - ymin))
 
-        # Find overlap region
-        mask1 = (cv2.cvtColor(warped1, cv2.COLOR_BGR2GRAY) > 0)
-        mask2 = (cv2.cvtColor(warped2, cv2.COLOR_BGR2GRAY) > 0)
-        overlap = mask1 & mask2
+        # Create masks
+        mask1 = cv2.warpPerspective(np.ones_like(img1[:, :, 0]), Ht @ H, (xmax - xmin, ymax - ymin))
+        mask2 = cv2.warpPerspective(np.ones_like(img2[:, :, 0]), Ht, (xmax - xmin, ymax - ymin))
 
-        # Alpha blending in overlap region
-        alpha = 0.5
-        for c in range(3):
-            warped1[overlap, c] = (alpha * warped1[overlap, c] +
-                                   (1 - alpha) * warped2[overlap, c]).astype(np.uint8)
-        warped1[~mask1] = warped2[~mask1]
+        # Blend images
+        result = np.zeros_like(warped1, dtype=np.float32)
 
-        return warped1
+        # Non-overlapping regions
+        result[mask1 > 0] = warped1[mask1 > 0]
+        result[mask2 > 0] = warped2[mask2 > 0]
+
+        # Overlapping regions
+        overlap = (mask1 > 0) & (mask2 > 0)
+        if overlap.any():
+            alpha = 0.5
+            result[overlap] = (alpha * warped1[overlap] + (1 - alpha) * warped2[overlap])
+
+        return result.astype(np.uint8)
 
 
 # Implementation
-
     """
     Corner Detection
     Save Corner detection output as corners.png
     """
-    # Detect corners in first image
-    C_img, corners, corner_scores = detect_corners(images[0])
-
-    # Visualize corners
-    corner_vis = images[0].copy()
-    for corner in corners:
-        x, y = corner[0], corner[1]  # Correctly unpack x,y coordinates
-        cv2.circle(corner_vis, (int(x), int(y)), 3, (0, 255, 0), -1)
-    cv2.imwrite('corners.png', corner_vis)
-
-    """
-    Perform ANMS: Adaptive Non-Maximal Suppression
-    Save ANMS output as anms.png
-    """
-    # Apply ANMS
-    anms_corners = adaptiveNonMaximalSuppression(C_img, NumFeatures)
-
-    # Visualize ANMS corners
-    anms_vis = images[0].copy()
-    for corner in anms_corners:
-        x, y = corner[0], corner[1]  # Correctly unpack x,y coordinates
-        cv2.circle(anms_vis, (int(x), int(y)), 3, (0, 255, 0), -1)
-    cv2.imwrite('anms.png', anms_vis)
-
-    """
-    Feature Descriptors
-    Save Feature Descriptor output as FD.png
-    """
-    # Extract features for ANMS corners
-    desc1, valid_corners1 = extract_features(images[0], anms_corners)
-
-    # Visualize feature patches
-    fd_vis = images[0].copy()
-    for corner in valid_corners1:
-        x, y = corner[0], corner[1]  # Correctly unpack x,y coordinates
-        cv2.circle(fd_vis, (int(x), int(y)), 3, (0, 255, 0), -1)
-        cv2.rectangle(fd_vis, (int(x - 20), int(y - 20)), (int(x + 20), int(y + 20)), (0, 255, 0), 1)
-    cv2.imwrite('FD.png', fd_vis)
-
-    """
-    Feature Matching
-    Save Feature Matching output as matching.png
-    """
-    # Detect and process corners in second image
-    C_img2, corners2, corner_scores2 = detect_corners(images[1])
-    anms_corners2 = adaptiveNonMaximalSuppression(C_img2, NumFeatures)
-    desc2, valid_corners2 = extract_features(images[1], anms_corners2)
-
-    # Match features
-    matches = match_features(desc1, desc2, valid_corners1, valid_corners2)
-
-    # Visualize matches
-    if len(matches) > 0:
-        # Create match visualization
-        match_vis = np.zeros((max(images[0].shape[0], images[1].shape[0]),
-                              images[0].shape[1] + images[1].shape[1], 3), dtype=np.uint8)
-        match_vis[:images[0].shape[0], :images[0].shape[1]] = images[0]
-        match_vis[:images[1].shape[0], images[0].shape[1]:] = images[1]
-
-        # Draw matches
-        for (x1, y1), (x2, y2) in matches:
-            x2 = int(x2 + images[0].shape[1])  # Offset x2 by width of first image
-            cv2.line(match_vis, (int(x1), int(y1)), (x2, int(y2)), (0, 255, 0), 1)
-        cv2.imwrite('matching.png', match_vis)
-
-    """
-    Refine: RANSAC, Estimate Homography
-    """
-    if len(matches) > 0:
-        H, mask = ransac_homography(matches)
-
-        """
-        Image Warping + Blending
-        Save Panorama output as mypano.png
-        """
-        if H is not None:
-            panorama = blend_images(images[0], images[1], H)
-            cv2.imwrite('mypano.png', panorama)
-        else:
-            print("Failed to compute homography")
+    print("1. Detecting corners...")
+    if use_gpu:
+        img0 = images[0].download()
     else:
-        print("No matches found between images")
+        img0 = images[0]
+    C_img, corners, scores = detect_corners(img0)
 
+    print(f"Found {len(corners) if corners is not None else 0} corners")
+
+    # Save corner detection visualization
+    corner_vis = img0.copy()
+    if corners is not None and len(corners) > 0:
+        for x, y in corners.astype(np.int32):
+            cv2.circle(corner_vis, (x, y), 3, (0, 255, 0), -1)
+    cv2.imwrite('corners.png', corner_vis)
+    print("Saved corners.png")
+
+    print("\n2. Performing ANMS...")
+    anms_corners = adaptiveNonMaximalSuppression(C_img, NumFeatures)
+    print(f"Selected {len(anms_corners)} corners after ANMS")
+
+    anms_vis = img0.copy()
+    if len(anms_corners) > 0:
+        for x, y in anms_corners.astype(np.int32):
+            cv2.circle(anms_vis, (x, y), 3, (0, 255, 0), -1)
+    cv2.imwrite('anms.png', anms_vis)
+    print("Saved anms.png")
+
+    print("\n3. Extracting feature descriptors...")
+    desc1, valid_corners1 = extract_features(img0, anms_corners)
+    print(f"Extracted {len(desc1)} valid features")
+
+    fd_vis = img0.copy()
+    if len(valid_corners1) > 0:
+        for x, y in valid_corners1.astype(np.int32):
+            cv2.circle(fd_vis, (x, y), 3, (0, 255, 0), -1)
+            cv2.rectangle(fd_vis, (x - 20, y - 20), (x + 20, y + 20), (0, 255, 0), 1)
+    cv2.imwrite('FD.png', fd_vis)
+    print("Saved FD.png")
+
+    # Initialize panorama with first image
+    panorama = img0
+
+    # For each subsequent image
+    print("\nProcessing remaining images...")
+    for i in range(1, len(images)):
+        print(f"\nProcessing image pair {i}/{len(images) - 1}")
+
+        print("1. Getting features from current panorama...")
+        C_img1, corners1, scores1 = detect_corners(panorama)
+        anms_corners1 = adaptiveNonMaximalSuppression(C_img1, NumFeatures)
+        desc1, valid_corners1 = extract_features(panorama, anms_corners1)
+
+        print("2. Getting features from next image...")
+        if use_gpu:
+            img_next = images[i].download()
+        else:
+            img_next = images[i]
+        C_img2, corners2, scores2 = detect_corners(img_next)
+        anms_corners2 = adaptiveNonMaximalSuppression(C_img2, NumFeatures)
+        desc2, valid_corners2 = extract_features(img_next, anms_corners2)
+
+        print("3. Matching features...")
+        matches = match_features(desc1, desc2, valid_corners1, valid_corners2)
+        print(f"Found {len(matches)} matches")
+
+        if len(matches) > 0:
+            # Create match visualization
+            h_max = max(panorama.shape[0], img_next.shape[0])
+            w_total = panorama.shape[1] + img_next.shape[1]
+            match_vis = np.zeros((h_max, w_total, 3), dtype=np.uint8)
+
+            # Copy images
+            match_vis[:panorama.shape[0], :panorama.shape[1]] = panorama
+            match_vis[:img_next.shape[0], panorama.shape[1]:] = img_next
+
+            # Draw matches
+            for (x1, y1), (x2, y2) in matches:
+                pt1 = (int(x1), int(y1))
+                pt2 = (int(x2 + panorama.shape[1]), int(y2))
+                cv2.line(match_vis, pt1, pt2, (0, 255, 0), 1)
+
+            cv2.imwrite(f'matching_{i}.png', match_vis)
+            print(f"Saved matching_{i}.png")
+
+            print("4. Computing homography using RANSAC...")
+            H, mask = ransac_homography(matches)
+
+            if H is not None:
+                print("5. Blending images...")
+                try:
+                    panorama = blend_images(panorama, img_next, H)
+                    cv2.imwrite(f'panorama_{i}.png', panorama)
+                    print(f"Saved panorama_{i}.png")
+                except Exception as e:
+                    print(f"Error blending images: {str(e)}")
+                    continue
+            else:
+                print(f"Failed to compute homography")
+        else:
+            print("No matches found between images")
+
+    # Save final panorama
+    cv2.imwrite('mypano.png', panorama)
+    print("\nPanorama creation completed! Final result saved as mypano.png")
 
 if __name__ == "__main__":
     main()
