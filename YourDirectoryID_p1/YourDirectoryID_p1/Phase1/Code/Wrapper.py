@@ -68,47 +68,48 @@ def main():
 	Save Corner detection output as corners.png
 	"""
 
-    def detect_corners(img):
+    def detect_corners(img, use_gpu=False):
         """
-        Detect corners using Harris corners
+        Detect corners using Harris corners with optional GPU acceleration
         Args:
-            img: Input image
-        Returns:
-            C_img: Corner response image from cornermetric
-            corners: Corner coordinates
-            scores: Corner response scores
+            img: Input image (can be GPU matrix)
+            use_gpu: Whether to use GPU acceleration
         """
-        # Convert to grayscale
-        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-        gray = np.float32(gray)
+        if use_gpu:
+            # Convert to grayscale on GPU
+            gray_gpu = cv2.cuda.cvtColor(img, cv2.COLOR_BGR2GRAY)
 
-        # Compute Harris corner response image
-        C_img = cv2.cornerHarris(gray, blockSize=2, ksize=3, k=0.04)
+            # Create GPU Harris detector
+            harris = cv2.cuda.createHarrisCorner(
+                blockSize=2,
+                ksize=3,
+                k=0.04
+            )
 
-        # Normalize corner response
-        C_img_norm = cv2.normalize(C_img, None, alpha=0, beta=1, norm_type=cv2.NORM_MINMAX)
+            # Compute corner response
+            C_img_gpu = harris.compute(gray_gpu)
+            C_img = C_img_gpu.download()
+        else:
+            # CPU implementation
+            gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+            gray = np.float32(gray)
+            C_img = cv2.cornerHarris(gray, blockSize=2, ksize=3, k=0.04)
 
+        print("Finding local maxima...")
         # Find local maxima
         corners = []
         scores = []
 
-        # Pad the corner response image to handle boundaries
-        padded = np.pad(C_img_norm, ((1, 1), (1, 1)), mode='constant')
+        for i in range(1, C_img.shape[0] - 1):
+            for j in range(1, C_img.shape[1] - 1):
+                window = C_img[i - 1:i + 2, j - 1:j + 2]
+                center = C_img[i, j]
 
-        # Find local maxima
-        for i in range(1, C_img_norm.shape[0] + 1):
-            for j in range(1, C_img_norm.shape[1] + 1):
-                # 3x3 window for local maximum check
-                window = padded[i - 1:i + 2, j - 1:j + 2]
-                center = window[1, 1]
-
-                # Check if center is local maximum and above threshold
-                if center > 0.01 * C_img_norm.max() and center == np.max(window):
-                    # Note: x=j-1, y=i-1 to convert back to image coordinates
-                    corners.append([j - 1, i - 1])  # Store as [x,y]
+                if center > 0.01 * C_img.max() and center == np.max(window):
+                    corners.append([j, i])  # x=j, y=i
                     scores.append(center)
 
-        return C_img_norm, np.array(corners), np.array(scores)
+        return C_img, np.array(corners), np.array(scores)
 
     """
 	Perform ANMS: Adaptive Non-Maximal Suppression
@@ -179,36 +180,49 @@ def main():
 	Save Feature Descriptor output as FD.png
 	"""
 
-    def extract_features(img, corners):
+    def extract_features(img, corners, use_gpu=False):
         """
-        Extract feature descriptors
-        Args:
-            img: Input image
-            corners: Corner points
-        Returns:
-            descriptors: Feature descriptors
-            valid_corners: Valid corner points
+        Extract feature descriptors with optional GPU acceleration
         """
-        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+        if use_gpu:
+            gray_gpu = cv2.cuda.cvtColor(img, cv2.COLOR_BGR2GRAY)
+            gray = gray_gpu.download()  # Need CPU for patch extraction
+        else:
+            gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+
         descriptors = []
         valid_corners = []
+        total = len(corners)
 
-        for x, y in corners:
-            # Check bounds for 41x41 patch
+        print(f"Extracting features from {total} corners...")
+        for idx, (x, y) in enumerate(corners):
+            if idx % 100 == 0:  # Progress update every 100 corners
+                print(f"Processing corner {idx}/{total}")
+
             x, y = int(x), int(y)
+            # Check bounds for 41x41 patch
             if y - 20 < 0 or y + 21 > gray.shape[0] or x - 20 < 0 or x + 21 > gray.shape[1]:
                 continue
 
-            # Extract 41x41 patch
+            # Extract patch
             patch = gray[y - 20:y + 21, x - 20:x + 21]
 
-            # Apply Gaussian blur
-            patch = cv2.GaussianBlur(patch, (3, 3), 0)
+            if use_gpu:
+                # Upload patch to GPU
+                patch_gpu = cv2.cuda_GpuMat()
+                patch_gpu.upload(patch)
 
-            # Subsample to 8x8
+                # Gaussian blur on GPU
+                patch_blur_gpu = cv2.cuda.createGaussianFilter(
+                    cv2.CV_8UC1, cv2.CV_8UC1, (3, 3), 0
+                )
+                patch_blur = patch_blur_gpu.apply(patch_gpu)
+                patch = patch_blur.download()
+            else:
+                patch = cv2.GaussianBlur(patch, (3, 3), 0)
+
+            # Resize and normalize
             patch = cv2.resize(patch, (8, 8))
-
-            # Normalize descriptor
             feat = patch.reshape(64)
             feat = (feat - feat.mean()) / (feat.std() + 1e-7)
 
@@ -222,71 +236,107 @@ def main():
 	Save Feature Matching output as matching.png
 	"""
 
-    def match_features(desc1, desc2, corners1, corners2):
+    def match_features(desc1, desc2, corners1, corners2, use_gpu=False):
         """
-        Match features using ratio test
+        Match features using ratio test with optional GPU acceleration
         """
         matches = []
+        total = len(desc1)
 
+        print(f"Matching features between {total} and {len(desc2)} descriptors...")
         for i, desc in enumerate(desc1):
-            # Compute SSD with all descriptors in desc2
-            dists = np.sum((desc2 - desc) ** 2, axis=1)
+            if i % 100 == 0:  # Progress update
+                print(f"Matching feature {i}/{total}")
 
-            # Find best and second best matches
-            idx = np.argsort(dists)
-            if len(idx) < 2:
-                continue
+            if use_gpu:
+                # Convert to GPU matrices
+                desc_gpu = cv2.cuda_GpuMat()
+                desc2_gpu = cv2.cuda_GpuMat()
+                desc_gpu.upload(desc.reshape(1, -1))
+                desc2_gpu.upload(desc2)
 
-            best = dists[idx[0]]
-            second_best = dists[idx[1]]
+                # Compute distances on GPU
+                bf_matcher = cv2.cuda.DescriptorMatcher_createBFMatcher(cv2.NORM_L2)
+                matches_gpu = bf_matcher.match(desc_gpu, desc2_gpu)
 
-            # Apply ratio test
-            if best < 0.8 * second_best:
-                matches.append((corners1[i], corners2[idx[0]]))
+                # Get best matches
+                matches_gpu = sorted(matches_gpu, key=lambda x: x.distance)
+                if len(matches_gpu) >= 2:
+                    best = matches_gpu[0].distance
+                    second_best = matches_gpu[1].distance
+
+                    if best < 0.8 * second_best:
+                        matches.append((corners1[i], corners2[matches_gpu[0].trainIdx]))
+            else:
+                # CPU implementation
+                dists = np.sum((desc2 - desc) ** 2, axis=1)
+                idx = np.argsort(dists)
+
+                if len(idx) >= 2:
+                    best = dists[idx[0]]
+                    second_best = dists[idx[1]]
+
+                    if best < 0.8 * second_best:
+                        matches.append((corners1[i], corners2[idx[0]]))
 
         return np.array(matches)
-
     """
 	Refine: RANSAC, Estimate Homography
 	"""
 
-    def ransac_homography(matches, threshold=5.0, max_iters=1000):
+    def ransac_homography(matches, threshold=5.0, max_iters=1000, use_gpu=False):
         """
-        Estimate homography using RANSAC following the steps:
-        1. Select four feature pairs (at random)
-        2. Compute homography H between these pairs
-        3. Compute inliers using SSD < τ
-        4. Repeat until max_iters or >90% inliers found
-        5. Keep largest set of inliers
-        6. Re-compute least-squares H estimate on all inliers
+        RANSAC with optional GPU acceleration
         """
         if len(matches) < 4:
             return None, None
 
-        p = np.float32(matches[:, 0])  # p_i from image 1
-        p_prime = np.float32(matches[:, 1])  # p'_i from image 2
+        p = np.float32(matches[:, 0])
+        p_prime = np.float32(matches[:, 1])
 
         best_H = None
         best_mask = None
         best_inliers = 0
 
-        for _ in range(max_iters):
-            # 1. Select four feature pairs
+        print(f"Running RANSAC for max {max_iters} iterations...")
+        for iter in range(max_iters):
+            if iter % 100 == 0:  # Progress update
+                print(f"RANSAC iteration {iter}/{max_iters}")
+
+            # Select random points
             idx = np.random.choice(len(matches), 4, replace=False)
             src_pts = p[idx].reshape(-1, 1, 2)
             dst_pts = p_prime[idx].reshape(-1, 1, 2)
 
-            # 2. Compute homography
-            H = cv2.findHomography(src_pts, dst_pts)[0]
+            if use_gpu:
+                # Upload points to GPU
+                src_gpu = cv2.cuda_GpuMat()
+                dst_gpu = cv2.cuda_GpuMat()
+                src_gpu.upload(src_pts)
+                dst_gpu.upload(dst_pts)
+
+                # Compute homography on GPU
+                H_gpu = cv2.cuda.findHomography(src_gpu, dst_gpu)
+                H = H_gpu.download()
+            else:
+                H = cv2.findHomography(src_pts, dst_pts)[0]
+
             if H is None:
                 continue
 
-            # 3. Compute SSD for all points
-            transformed = cv2.perspectiveTransform(p.reshape(-1, 1, 2), H)
+            # Transform points
+            if use_gpu:
+                p_gpu = cv2.cuda_GpuMat()
+                p_gpu.upload(p.reshape(-1, 1, 2))
+                transformed_gpu = cv2.cuda.warpPerspective(p_gpu, H_gpu, p.shape[::-1])
+                transformed = transformed_gpu.download()
+            else:
+                transformed = cv2.perspectiveTransform(p.reshape(-1, 1, 2), H)
+
             if transformed is None:
                 continue
 
-            # SSD calculation
+            # Compute inliers
             ssd = np.sum((p_prime.reshape(-1, 1, 2) - transformed) ** 2, axis=(1, 2))
             mask = ssd < threshold
             inliers = np.sum(mask)
@@ -295,17 +345,13 @@ def main():
                 best_inliers = inliers
                 best_H = H
                 best_mask = mask
+                print(f"Found better model with {inliers} inliers")
 
-            # Check for 90% inliers
             if best_inliers > len(p) * 0.9:
+                print("Early termination - found good model")
                 break
 
-        # 5-6. Use largest inlier set to recompute H
-        if best_mask is not None and np.sum(best_mask) >= 4:
-            src_pts = p[best_mask].reshape(-1, 1, 2)
-            dst_pts = p_prime[best_mask].reshape(-1, 1, 2)
-            best_H = cv2.findHomography(src_pts, dst_pts)[0]
-
+        print(f"RANSAC completed with {best_inliers} inliers")
         return best_H, best_mask
 
     """
