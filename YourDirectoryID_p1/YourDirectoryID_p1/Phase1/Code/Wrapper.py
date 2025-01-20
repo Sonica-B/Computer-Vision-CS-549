@@ -24,8 +24,8 @@ import os
 def main():
     # Add any Command Line arguments here
     Parser = argparse.ArgumentParser()
-    Parser.add_argument('--NumFeatures', default=10000, help='Number of best features to extract from each image, Default:100')
-    Parser.add_argument('--folder', default='../Data/Train/Set1', help='Path to image folder')
+    Parser.add_argument('--NumFeatures', default=1000, help='Number of best features to extract from each image, Default:100')
+    Parser.add_argument('--folder', default='../Data/Train/Set2', help='Path to image folder')
     Args = Parser.parse_args()
     NumFeatures = Args.NumFeatures
     folder_path = Args.folder
@@ -172,54 +172,77 @@ def main():
 	Refine: RANSAC, Estimate Homography
 	"""
 
-    def ransac_homography(matches, threshold=5.0, max_iters=1000):
+    def ransac_homography(matches, threshold=5.0, N_max=1000):
         """
-        Estimate homography using RANSAC
+        Estimate homography using RANSAC following the specified steps:
+        1. Select four feature pairs (at random)
+        2. Compute homography H between these pairs
+        3. Compute inliers using SSD < τ
+        4. Repeat until N_max iterations or >90% inliers found
+        5. Keep largest set of inliers
+        6. Re-compute least-squares H estimate on all inliers
+
+        Args:
+            matches: Nx2x2 array of matching point pairs
+            threshold: τ for SSD threshold
+            N_max: Maximum number of iterations
+
+        Returns:
+            H: 3x3 homography matrix
+            mask: Boolean array indicating inliers
         """
         if len(matches) < 4:
             return None, None
 
-        pts1 = matches[:, 0]
-        pts2 = matches[:, 1]
+        # Convert matches to separate source and destination points
+        p = np.float32(matches[:, 0])  # p_i from image 1
+        p_prime = np.float32(matches[:, 1])  # p'_i from image 2
 
         best_H = None
         best_mask = None
         best_inliers = 0
 
-        for _ in range(max_iters):
-            # 1. Select 4 random correspondences
+        for _ in range(N_max):
+            # 1. Select four feature pairs at random
             idx = np.random.choice(len(matches), 4, replace=False)
-            sample1 = pts1[idx]
-            sample2 = pts2[idx]
+            src_pts = p[idx].reshape(-1, 1, 2)
+            dst_pts = p_prime[idx].reshape(-1, 1, 2)
 
-            # 2. Compute homography
-            H = cv2.findHomography(sample1.reshape(-1, 1, 2),
-                                   sample2.reshape(-1, 1, 2))[0]
+            # 2. Compute homography H between point pairs
+            H, _ = cv2.findHomography(src_pts, dst_pts)
             if H is None:
                 continue
 
-            # 3. Count inliers
-            pts1_h = np.hstack((pts1, np.ones((len(pts1), 1))))
-            pts2_proj = (H @ pts1_h.T).T
-            pts2_proj = pts2_proj[:, :2] / pts2_proj[:, 2:]
+            # 3. Compute SSD for all points
+            p_transformed = cv2.perspectiveTransform(p.reshape(-1, 1, 2), H)
+            if p_transformed is None:
+                continue
 
-            distances = np.linalg.norm(pts2 - pts2_proj, axis=1)
-            mask = distances < threshold
+            # Calculate SSD (sum of squared differences)
+            ssd = np.sum((p_prime.reshape(-1, 1, 2) - p_transformed) ** 2, axis=(1, 2))
+
+            # Find inliers where SSD < τ
+            mask = ssd < threshold
             num_inliers = np.sum(mask)
 
+            # Update best result if we found more inliers
             if num_inliers > best_inliers:
                 best_inliers = num_inliers
                 best_H = H
                 best_mask = mask
 
-            # Early termination if found 90% inliers
-            if best_inliers > len(pts1) * 0.9:
+            # 4. Early termination if we found more than 90% inliers
+            if best_inliers > len(p) * 0.9:
                 break
 
-        # 6. Recompute H using all inliers
-        if best_mask is not None and np.sum(best_mask) >= 4:
-            best_H = cv2.findHomography(pts1[best_mask].reshape(-1, 1, 2),
-                                        pts2[best_mask].reshape(-1, 1, 2))[0]
+        # 5. Keep largest set of inliers
+        if best_mask is None or np.sum(best_mask) < 4:
+            return None, None
+
+        # 6. Re-compute least-squares H estimate on all inliers
+        src_pts_inliers = p[best_mask].reshape(-1, 1, 2)
+        dst_pts_inliers = p_prime[best_mask].reshape(-1, 1, 2)
+        best_H, _ = cv2.findHomography(src_pts_inliers, dst_pts_inliers, method=cv2.RANSAC)
 
         return best_H, best_mask
 
