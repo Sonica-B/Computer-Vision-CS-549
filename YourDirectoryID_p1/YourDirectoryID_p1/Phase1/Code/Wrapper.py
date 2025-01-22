@@ -25,7 +25,7 @@ def main():
     # Add any Command Line arguments here
     Parser = argparse.ArgumentParser()
     Parser.add_argument('--NumFeatures', default=1000, help='Number of best features to extract from each image, Default:100')
-    Parser.add_argument('--folder', default='../Data/Train/Set2', help='Path to image folder')
+    Parser.add_argument('--folder', default='../Data/Train/Set1', help='Path to image folder')
     Args = Parser.parse_args()
     NumFeatures = int(Args.NumFeatures)
     folder_path = Args.folder
@@ -69,17 +69,12 @@ def main():
 	"""
 
     def detect_corners(img, use_gpu=False):
-        """
-        Detect corners using Harris corners with optional GPU acceleration
-        Args:
-            img: Input image (can be GPU matrix)
-            use_gpu: Whether to use GPU acceleration
-        """
+
         if use_gpu:
-            # Convert to grayscale on GPU
+            # Convert to grayscale
             gray_gpu = cv2.cuda.cvtColor(img, cv2.COLOR_BGR2GRAY)
 
-            # Create GPU Harris detector
+            # Create Harris detector
             harris = cv2.cuda.createHarrisCorner(
                 blockSize=2,
                 ksize=3,
@@ -90,7 +85,7 @@ def main():
             C_img_gpu = harris.compute(gray_gpu)
             C_img = C_img_gpu.download()
         else:
-            # CPU implementation
+
             gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
             gray = np.float32(gray)
             C_img = cv2.cornerHarris(gray, blockSize=2, ksize=3, k=0.04)
@@ -117,14 +112,7 @@ def main():
 	"""
 
     def adaptiveNonMaximalSuppression(C_img, N_best):
-        """
-        Implement ANMS as specified in the algorithm
-        Args:
-            C_img: Corner score image (obtained using cornermetric)
-            N_best: Number of best corners needed
-        Returns:
-            Array of (x_i, y_i) coordinates for i = 1:N_best
-        """
+
         # Find all local maxima
         h, w = C_img.shape
         local_maxima = []
@@ -145,7 +133,7 @@ def main():
         local_maxima = np.array(local_maxima)
         N_strong = len(local_maxima)
 
-        if N_strong < 4:  # Need at least 4 corners for homography
+        if N_strong < 4:
             return local_maxima
 
         # Initialize r_i = infinity for i = [1:N_strong]
@@ -164,16 +152,16 @@ def main():
 
                 # Compare corner responses
                 if C_img[y_j, x_j] > C_img[y_i, x_i]:
-                    # Calculate Euclidean distance
+                    # Euclidean distance
                     ED = (x_j - x_i) ** 2 + (y_j - y_i) ** 2
-                    # Update r_i if necessary
+                    # Update r_i
                     r[i] = min(r[i], ED)
 
-        # Sort r_i in descending order and pick top N_best points
+        # Pick top N_best points
         idx = np.argsort(r)[::-1]
         idx = idx[:min(N_best, N_strong)]
 
-        return local_maxima[idx]
+        return local_maxima[idx] # Array of (x_i, y_i) coordinates for i = 1:N_best
 
     """
 	Feature Descriptors
@@ -181,9 +169,7 @@ def main():
 	"""
 
     def extract_features(img, corners, use_gpu=False):
-        """
-        Extract feature descriptors with optional GPU acceleration
-        """
+
         if use_gpu:
             gray_gpu = cv2.cuda.cvtColor(img, cv2.COLOR_BGR2GRAY)
             gray = gray_gpu.download()  # Need CPU for patch extraction
@@ -208,11 +194,11 @@ def main():
             patch = gray[y - 20:y + 21, x - 20:x + 21]
 
             if use_gpu:
-                # Upload patch to GPU
+
                 patch_gpu = cv2.cuda_GpuMat()
                 patch_gpu.upload(patch)
 
-                # Gaussian blur on GPU
+                # Gaussian blur
                 patch_blur_gpu = cv2.cuda.createGaussianFilter(
                     cv2.CV_8UC1, cv2.CV_8UC1, (3, 3), 0
                 )
@@ -237,9 +223,7 @@ def main():
 	"""
 
     def match_features(desc1, desc2, corners1, corners2, use_gpu=False):
-        """
-        Match features using ratio test with optional GPU acceleration
-        """
+
         matches = []
         total = len(desc1)
 
@@ -255,7 +239,7 @@ def main():
                 desc_gpu.upload(desc.reshape(1, -1))
                 desc2_gpu.upload(desc2)
 
-                # Compute distances on GPU
+                # Compute distances
                 bf_matcher = cv2.cuda.DescriptorMatcher_createBFMatcher(cv2.NORM_L2)
                 matches_gpu = bf_matcher.match(desc_gpu, desc2_gpu)
 
@@ -285,9 +269,7 @@ def main():
 	"""
 
     def ransac_homography(matches, threshold=5.0, max_iters=1000, use_gpu=False):
-        """
-        RANSAC with optional GPU acceleration
-        """
+
         if len(matches) < 4:
             return None, None
 
@@ -309,13 +291,13 @@ def main():
             dst_pts = p_prime[idx].reshape(-1, 1, 2)
 
             if use_gpu:
-                # Upload points to GPU
+
                 src_gpu = cv2.cuda_GpuMat()
                 dst_gpu = cv2.cuda_GpuMat()
                 src_gpu.upload(src_pts)
                 dst_gpu.upload(dst_pts)
 
-                # Compute homography on GPU
+
                 H_gpu = cv2.cuda.findHomography(src_gpu, dst_gpu)
                 H = H_gpu.download()
             else:
@@ -360,13 +342,10 @@ def main():
 	"""
 
     def blend_images(img1, img2, H):
-        """
-        Blend images using homography
-        """
-        # Convert H to float32
+
         H = H.astype(np.float32)
 
-        # Get dimensions
+
         h1, w1 = img1.shape[:2]
         h2, w2 = img2.shape[:2]
 
@@ -407,10 +386,8 @@ def main():
 
 
 # Implementation
-    """
-    Corner Detection
-    Save Corner detection output as corners.png
-    """
+
+    # Corner Detection
     print("1. Detecting corners...")
     if use_gpu:
         img0 = images[0].download()
@@ -420,14 +397,15 @@ def main():
 
     print(f"Found {len(corners) if corners is not None else 0} corners")
 
-    # Save corner detection visualization
+    # Visualization
     corner_vis = img0.copy()
     if corners is not None and len(corners) > 0:
         for x, y in corners.astype(np.int32):
             cv2.circle(corner_vis, (x, y), 3, (0, 255, 0), -1)
-    cv2.imwrite('corners.png', corner_vis)
+    cv2.imwrite('Outputs/corners.png', corner_vis)
     print("Saved corners.png")
 
+    # ANMS
     print("\n2. Performing ANMS...")
     anms_corners = adaptiveNonMaximalSuppression(C_img, NumFeatures)
     print(f"Selected {len(anms_corners)} corners after ANMS")
@@ -436,9 +414,10 @@ def main():
     if len(anms_corners) > 0:
         for x, y in anms_corners.astype(np.int32):
             cv2.circle(anms_vis, (x, y), 3, (0, 255, 0), -1)
-    cv2.imwrite('anms.png', anms_vis)
+    cv2.imwrite('Outputs/anms.png', anms_vis)
     print("Saved anms.png")
 
+    # Feature Extraction
     print("\n3. Extracting feature descriptors...")
     desc1, valid_corners1 = extract_features(img0, anms_corners)
     print(f"Extracted {len(desc1)} valid features")
@@ -448,10 +427,10 @@ def main():
         for x, y in valid_corners1.astype(np.int32):
             cv2.circle(fd_vis, (x, y), 3, (0, 255, 0), -1)
             cv2.rectangle(fd_vis, (x - 20, y - 20), (x + 20, y + 20), (0, 255, 0), 1)
-    cv2.imwrite('FD.png', fd_vis)
+    cv2.imwrite('Outputs/FD.png', fd_vis)
     print("Saved FD.png")
 
-    # Initialize panorama with first image
+    # Panorama with first image
     panorama = img0
 
     # For each subsequent image
@@ -493,7 +472,7 @@ def main():
                 pt2 = (int(x2 + panorama.shape[1]), int(y2))
                 cv2.line(match_vis, pt1, pt2, (0, 255, 0), 1)
 
-            cv2.imwrite(f'matching_{i}.png', match_vis)
+            cv2.imwrite(f'Outputs/matching_{i}.png', match_vis)
             print(f"Saved matching_{i}.png")
 
             print("4. Computing homography using RANSAC...")
@@ -503,7 +482,7 @@ def main():
                 print("5. Blending images...")
                 try:
                     panorama = blend_images(panorama, img_next, H)
-                    cv2.imwrite(f'panorama_{i}.png', panorama)
+                    cv2.imwrite(f'Outputs/panorama_{i}.png', panorama)
                     print(f"Saved panorama_{i}.png")
                 except Exception as e:
                     print(f"Error blending images: {str(e)}")
@@ -514,7 +493,7 @@ def main():
             print("No matches found between images")
 
     # Save final panorama
-    cv2.imwrite('mypano.png', panorama)
+    cv2.imwrite('Outputs/mypano.png', panorama)
     print("\nPanorama creation completed! Final result saved as mypano.png")
 
 if __name__ == "__main__":
