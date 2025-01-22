@@ -19,7 +19,6 @@ import cv2
 
 # Add any python libraries here
 import torch
-import kornia as K
 import argparse
 import os
 
@@ -31,25 +30,18 @@ def main():
     Parser.add_argument('--output_dir', default='Outputs', help='Output directory')
     Args = Parser.parse_args()
 
-    # num_features = int(Args.NumFeatures)
-    # folder_path = Args.folder
+
+    num_features = int(Args.NumFeatures)
     os.makedirs(Args.output_dir, exist_ok=True)
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
     """
     Read a set of images for Panorama stitching
     """
 
     # Read images
-    images = []
-    for f in sorted(os.listdir(Args.folder)):
-        if f.endswith('.jpg'):
-            img = cv2.imread(os.path.join(Args.folder, f))
-            if img is not None:
-                images.append(img)
-
-    if len(images) < 2:
-        print("Need at least 2 images")
+    images = [cv2.imread(os.path.join(Args.folder, f)) for f in sorted(os.listdir(Args.folder)) if f.endswith('.jpg')]
+    if len(images) < 3:
+        print("Need at least 3 images for panorama creation.")
         return
 
     """
@@ -58,13 +50,14 @@ def main():
 	"""
 
     def detect_corners_all_images(images, num_features, output_dir='Outputs'):
-        """Detect corners in all images using goodFeaturesToTrack"""
+        print("Step 1: Detecting corners in all images...")
         all_corners = []
         all_responses = []
 
         for i, img in enumerate(images):
             gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
 
+            # Detect corners
             corners = cv2.goodFeaturesToTrack(
                 gray,
                 maxCorners=num_features,
@@ -72,18 +65,20 @@ def main():
                 minDistance=10
             )
 
+            if corners is None:
+                print(f"No corners detected in image {i + 1}")
+                continue
+
+            # Compute corner responses
             response = cv2.cornerHarris(gray, blockSize=2, ksize=3, k=0.04)
             corners = corners.reshape(-1, 2)
-
-            if corners is None:
-                print(f"No corners detected in image {i}")
-                continue
 
             # Save visualization
             vis = img.copy()
             for x, y in corners.astype(np.int32):
                 cv2.circle(vis, (int(x), int(y)), 3, (0, 255, 0), -1)
             cv2.imwrite(f'{output_dir}/corners_{i + 1}.png', vis)
+            print(f"Corners detected and saved for image {i + 1}.")
 
             all_corners.append(corners)
             all_responses.append(response)
@@ -133,7 +128,6 @@ def main():
 	"""
 
     def adaptive_non_maximal_suppression(C_img, corners, num_best):
-        """ANMS implementation following instructions exactly"""
         N_strong = len(corners)
         if N_strong <= num_best:
             return corners
@@ -143,16 +137,11 @@ def main():
 
         for i in range(N_strong):
             for j in range(N_strong):
-                if i != j and scores[j] > scores[i]:
+                if scores[j] > scores[i]:
                     ED = (corners[j, 0] - corners[i, 0]) ** 2 + (corners[j, 1] - corners[i, 1]) ** 2
                     r[i] = min(r[i], ED)
 
         idx = np.argsort(r)[::-1][:num_best]
-
-        if corners is None or len(corners) < num_best:
-            print("Not enough corners for ANMS.")
-            return corners
-
         return corners[idx]
 
     # def adaptiveNonMaximalSuppression(C_img, N_best):
@@ -212,32 +201,32 @@ def main():
 	Save Feature Descriptor output as FD.png
 	"""
 
-    def extract_features(img, corners):
+    def extract_features(img, corners, output_dir, img_idx):
+        print(f"Step 3: Extracting features for image {img_idx + 1}...")
         descriptors = []
+        vis = img.copy()
         for x, y in corners:
-            # Extract 41x41 patch centered on the keypoint
             x, y = int(x), int(y)
+
             patch_x1 = max(x - 20, 0)
             patch_x2 = min(x + 21, img.shape[1])
             patch_y1 = max(y - 20, 0)
             patch_y2 = min(y + 21, img.shape[0])
             patch = img[patch_y1:patch_y2, patch_x1:patch_x2]
 
-            # Apply Gaussian blur
             patch = cv2.GaussianBlur(patch, (3, 3), 0)
-
-            # Subsample to 8x8
             patch = cv2.resize(patch, (8, 8))
 
-            # Reshape and standardize
             feat = patch.flatten()
             feat = (feat - feat.mean()) / (feat.std() + 1e-7)
-
             descriptors.append(feat)
 
-        if corners is None or len(corners) == 0:
-            print("No valid corners for feature extraction.")
-            return np.array([])
+            cv2.circle(vis, (x, y), 3, (0, 255, 0), -1)
+            cv2.rectangle(vis, (x - 20, y - 20), (x + 20, y + 20), (255, 0, 0), 1)
+
+        cv2.imwrite(f'{output_dir}/features_{img_idx + 1}.png', vis)
+        print(f"Features extracted and visualization saved for image {img_idx + 1}.")
+
         return np.array(descriptors)
     # def extract_features(img, corners, use_gpu=False):
     #
@@ -293,18 +282,24 @@ def main():
 	Save Feature Matching output as matching.png
 	"""
 
-    def match_features(desc1, desc2, corners1, corners2):
+
+    def match_features(desc1, desc2, corners1, corners2, output_dir, img_idx):
+        print(f"Step 4: Matching features between images {img_idx} and {img_idx + 1}...")
         matches = []
-        if desc1 is None or desc2 is None or len(desc1) == 0 or len(desc2) == 0:
-            return matches  # Return an empty list if descriptors are missing
         for i, desc in enumerate(desc1):
-            # Compute cosine similarity between current descriptor and all others
             dists = np.sum((desc2 - desc) ** 2, axis=1)
 
-            # Find best and second-best matches
             idx = np.argsort(dists)
             if dists[idx[0]] < 0.8 * dists[idx[1]]:
                 matches.append((corners1[i], corners2[idx[0]]))
+
+        vis = np.zeros((500, 500, 3), dtype=np.uint8)
+        for pt1, pt2 in matches:
+            cv2.circle(vis, (int(pt1[0]), int(pt1[1])), 3, (0, 255, 0), -1)
+            cv2.circle(vis, (int(pt2[0]), int(pt2[1])), 3, (0, 0, 255), -1)
+        cv2.imwrite(f'{output_dir}/matches_{img_idx + 1}.png', vis)
+        print(f"Feature matching completed and visualization saved for image {img_idx}.")
+
         return np.array(matches)
 
     # def match_features(desc1, desc2, corners1, corners2, use_gpu=False):
@@ -353,63 +348,25 @@ def main():
 	Refine: RANSAC, Estimate Homography
 	"""
 
-    def ransac_homography(matches, threshold=5.0, max_iters=1000, output_dir='Outputs', img_idx=0):
+    def ransac_homography(matches, threshold=5.0, max_iters=1000):
+        print("Step 5: Running RANSAC to estimate homography...")
         if len(matches) < 4:
-            print(f"Not enough matches to compute homography for image {img_idx}. Matches found: {len(matches)}")
+            print("Not enough matches for RANSAC.")
             return None, None
-
-        best_H = None
-        best_mask = None
-        best_inliers = 0
 
         pts1 = np.array([m[0] for m in matches], dtype=np.float32)
         pts2 = np.array([m[1] for m in matches], dtype=np.float32)
 
-        for _ in range(max_iters):
-            # Randomly select 4 matches
-            idx = np.random.choice(len(matches), 4, replace=False)
-            src_pts = pts1[idx].reshape(-1, 1, 2).astype(np.float32)
-            dst_pts = pts2[idx].reshape(-1, 1, 2).astype(np.float32)
+        H, mask = cv2.findHomography(pts1, pts2, cv2.RANSAC, threshold)
 
-            # Validate points
-            if src_pts.shape != (4, 1, 2) or dst_pts.shape != (4, 1, 2):
-                print(f"Invalid point shape: src_pts {src_pts.shape}, dst_pts {dst_pts.shape}")
-                continue
+        if H is None or mask is None:
+            print("RANSAC failed to find a valid homography.")
+            return None, None
 
-            try:
-                H = cv2.getPerspectiveTransform(src_pts, dst_pts)
-            except cv2.error as e:
-                print(f"Error in getPerspectiveTransform: {e}")
-                continue
+        inlier_count = np.sum(mask)
+        print(f"RANSAC succeeded with {inlier_count} inliers.")
 
-            if H is None:
-                continue
-
-            # Transform points
-            pts1_transformed = cv2.perspectiveTransform(pts1.reshape(-1, 1, 2), H)
-            if pts1_transformed is None:
-                continue
-
-            # Compute SSD and inliers
-            ssd = np.sum((pts2.reshape(-1, 1, 2) - pts1_transformed) ** 2, axis=2).reshape(-1)
-            mask = ssd < threshold
-            inliers = np.sum(mask)
-
-            if inliers > best_inliers:
-                best_inliers = inliers
-                best_H = H
-                best_mask = mask
-
-            if best_inliers > len(matches) * 0.9:
-                break
-
-        # Recompute homography with all inliers
-        if best_mask is not None and np.sum(best_mask) >= 4:
-            src_pts = pts1[best_mask].reshape(-1, 1, 2).astype(np.float32)
-            dst_pts = pts2[best_mask].reshape(-1, 1, 2).astype(np.float32)
-            best_H = cv2.getPerspectiveTransform(src_pts, dst_pts)
-
-        return best_H, best_mask
+        return H, mask.flatten()
 
     # def ransac_homography(matches, threshold=5.0, max_iters=1000, use_gpu=False):
     #
@@ -484,42 +441,29 @@ def main():
 	Save Panorama output as mypano.png
 	"""
 
-    def blend_images(img1, img2, H):
-        """Blend images using OpenCV with proper overlap handling."""
-        H = H.astype(np.float32)
-
+    def blend_images(img1, img2, H, output_dir, img_idx):
+        print(f"Step 6: Blending image {img_idx + 1} with the panorama...")
         h1, w1 = img1.shape[:2]
         h2, w2 = img2.shape[:2]
 
-        # Transform corners
         corners1 = np.float32([[0, 0], [w1, 0], [w1, h1], [0, h1]]).reshape(-1, 1, 2)
         corners2 = cv2.perspectiveTransform(corners1, H)
-        corners = np.concatenate((corners2, np.float32([[0, 0], [w2, 0], [w2, h2], [0, h2]]).reshape(-1, 1, 2)))
+        corners2 = corners2.reshape(-1, 2)  # Flatten to match 2D corner dimensions
+        corners = np.vstack((corners2, [[0, 0], [w2, 0], [w2, h2], [0, h2]]))
 
-        # Determine size of the resulting panorama
-        [xmin, ymin] = np.int32(corners.min(axis=0).ravel() - 0.5)
-        [xmax, ymax] = np.int32(corners.max(axis=0).ravel() + 0.5)
-        t = [-xmin, -ymin]
-        Ht = np.array([[1, 0, t[0]], [0, 1, t[1]], [0, 0, 1]], dtype=np.float32)
+        [xmin, ymin] = np.int32(corners.min(axis=0).ravel())
+        [xmax, ymax] = np.int32(corners.max(axis=0).ravel())
+        translation = np.float32([[1, 0, -xmin], [0, 1, -ymin], [0, 0, 1]])
 
-        # Warp images
-        warped1 = cv2.warpPerspective(img1, Ht @ H, (xmax - xmin, ymax - ymin))
-        warped2 = cv2.warpPerspective(img2, Ht, (xmax - xmin, ymax - ymin))
+        warped1 = cv2.warpPerspective(img1, translation @ H, (xmax - xmin, ymax - ymin))
+        warped2 = cv2.warpPerspective(img2, translation, (xmax - xmin, ymax - ymin))
 
-        # Create masks for blending
-        mask1 = cv2.warpPerspective(np.ones_like(img1[:, :, 0]), Ht @ H, (xmax - xmin, ymax - ymin))
-        mask2 = cv2.warpPerspective(np.ones_like(img2[:, :, 0]), Ht, (xmax - xmin, ymax - ymin))
+        result = np.where(warped2 > 0, warped2, warped1)
 
-        # Blend images
-        result = np.zeros_like(warped1, dtype=np.float32)
-        result[mask1 > 0] = warped1[mask1 > 0]
-        result[mask2 > 0] = warped2[mask2 > 0]
+        cv2.imwrite(f'{output_dir}/panorama_{img_idx + 1}.png', result)
+        print(f"Panorama blended and saved for image {img_idx + 1}.")
 
-        # Handle overlapping regions by averaging
-        overlap = (mask1 > 0) & (mask2 > 0)
-        result[overlap] = (warped1[overlap] + warped2[overlap]) / 2
-
-        return result.astype(np.uint8)
+        return result
 
     # def blend_images(img1, img2, H):
     #
@@ -563,99 +507,76 @@ def main():
     #         result[overlap] = (alpha * warped1[overlap] + (1 - alpha) * warped2[overlap])
     #
     #     return result.astype(np.uint8)
-    def create_matching_visualization(matches, mask, img_idx):
-        # Check if matches is None or empty
-        if matches is None or matches.size == 0:
-            return np.zeros((100, 100, 3), dtype=np.uint8)
 
-        # Proceed with visualization logic
-        max_h, max_w = 0, 0
-        for pt1, pt2 in matches:
-            max_h = max(max_h, 1)  # Use default size since points are 2D
-            max_w = max(max_w, 1)
-
-        vis = np.zeros((max_h, max_w * len(matches), 3), dtype=np.uint8)
-
-        for idx, (pt1, pt2) in enumerate(matches):
-            color = (0, 255, 0) if mask[idx] else (0, 0, 255)
-            cv2.circle(vis, (int(pt1[0]), int(pt1[1])), 3, color, -1)
-            cv2.circle(vis, (int(pt2[0]) + max_w, int(pt2[1])), 3, color, -1)
-            cv2.line(vis, (int(pt1[0]), int(pt1[1])),
-                     (int(pt2[0]) + max_w, int(pt2[1])), color, 1)
-
-        return vis
 
 # Implementation
 
-    # Process all images
-    all_corners, all_responses = detect_corners_all_images(
-        images, Args.NumFeatures, Args.output_dir
-    )
+    all_corners, all_responses = detect_corners_all_images(images, num_features, Args.output_dir)
 
-    # ANMS for all images
     all_anms_corners = []
     for i, (corners, response) in enumerate(zip(all_corners, all_responses)):
-        anms_corners = adaptive_non_maximal_suppression(
-            response, corners, Args.NumFeatures
-        )
+        anms_corners = adaptive_non_maximal_suppression(response, corners, num_features)
         all_anms_corners.append(anms_corners)
 
-        # Save ANMS visualization
-        vis = images[i].copy()
-        for x, y in anms_corners.astype(np.int32):
-            cv2.circle(vis, (int(x), int(y)), 3, (0, 255, 0), -1)
-        cv2.imwrite(f'{Args.output_dir}/anms_{i + 1}.png', vis)
-
-    # Extract features
     all_descriptors = []
-    valid_corners = []
     for i, (img, corners) in enumerate(zip(images, all_anms_corners)):
-        desc = extract_features(img, corners)
+        desc = extract_features(img, corners, Args.output_dir, i)
         all_descriptors.append(desc)
-        valid_corners.append(corners)
 
-        # Save feature visualization
-        vis = img.copy()
-        for x, y in corners.astype(np.int32):
-            cv2.circle(vis, (int(x), int(y)), 3, (0, 255, 0), -1)
-            cv2.rectangle(vis, (int(x) - 20, int(y) - 20),
-                          (int(x) + 20, int(y) + 20), (0, 255, 0), 1)
-        cv2.imwrite(f'{Args.output_dir}/features_{i + 1}.png', vis)
-
-    # Initialize panorama
     panorama = images[0]
-
-    # Process image pairs
     for i in range(1, len(images)):
-        matches = match_features(all_descriptors[i - 1], all_descriptors[i], valid_corners[i - 1], valid_corners[i])
+        matches = match_features(all_descriptors[i - 1], all_descriptors[i], all_anms_corners[i - 1], all_anms_corners[i], Args.output_dir, i)
 
-        if len(matches) < 10:
-            print(f"Too few matches for image {i}")
+        if len(matches) < 4:
+            print(f"Too few matches for image {i}, skipping.")
             continue
+        print(f"Number of matches: {len(matches)}")
+        print(f"Matches: {matches[:5]}")
 
-        # Save matching visualization
-        vis = create_matching_visualization(matches, np.ones(len(matches)), i)
-        cv2.imwrite(f'{Args.output_dir}/matches_{i}.png', vis)
-
-        # RANSAC
-        H, mask = ransac_homography(
-            matches, output_dir=Args.output_dir, img_idx=i
-        )
-
+        H, mask = ransac_homography(matches)
         if H is None:
-            print(f"Failed to find homography for image {i}")
+            print(f"Skipping image {i} due to invalid homography.")
             continue
 
-        # Blend images
-        try:
-            panorama = blend_images(panorama, images[i], H, device)
-            cv2.imwrite(f'{Args.output_dir}/panorama_{i}.png', panorama)
-        except Exception as e:
-            print(f"Error blending image {i}: {str(e)}")
-            continue
+        panorama = blend_images(panorama, images[i], H, Args.output_dir, i)
 
     cv2.imwrite(f'{Args.output_dir}/final_panorama.png', panorama)
-    print("Panorama creation completed")
+    print("Panorama creation completed.")
+
+    # # Initialize panorama
+    # panorama = images[0]
+    #
+    # # Process image pairs
+    # for i in range(1, len(images)):
+    #     matches = match_features(all_descriptors[i - 1], all_descriptors[i], valid_corners[i - 1], valid_corners[i])
+    #
+    #     if len(matches) < 10:
+    #         print(f"Too few matches for image {i}")
+    #         continue
+    #
+    #     # Save matching visualization
+    #     vis = create_matching_visualization(matches, np.ones(len(matches)), i)
+    #     cv2.imwrite(f'{Args.output_dir}/matches_{i}.png', vis)
+    #
+    #     # RANSAC
+    #     H, mask = ransac_homography(
+    #         matches, output_dir=Args.output_dir, img_idx=i
+    #     )
+    #
+    #     if H is None:
+    #         print(f"Failed to find homography for image {i}")
+    #         continue
+    #
+    #     # Blend images
+    #     try:
+    #         panorama = blend_images(panorama, images[i], H)
+    #         cv2.imwrite(f'{Args.output_dir}/panorama_{i}.png', panorama)
+    #     except Exception as e:
+    #         print(f"Error blending image {i}: {str(e)}")
+    #         continue
+    #
+    # cv2.imwrite(f'{Args.output_dir}/final_panorama.png', panorama)
+    # print("Panorama creation completed")
 
 
 if __name__ == "__main__":
