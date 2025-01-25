@@ -21,16 +21,18 @@ import cv2
 import torch
 import argparse
 import os
+from collections import defaultdict
 
 def main():
     # Add any Command Line arguments here
     Parser = argparse.ArgumentParser()
-    Parser.add_argument('--NumFeatures', default=1000, help='Number of best features to extract from each image, Default:100')
-    Parser.add_argument('--folder', default='../Data/Train/Set3', help='Path to image folder')
+    Parser.add_argument('--NumFeatures', default=1000, type= int, help='Number of best features to extract from each image, Default:100')
+    Parser.add_argument('--folder', default='../Data/Train/Set2', help='Path to image folder')
     Parser.add_argument('--output_dir', default='Outputs', help='Output directory')
     Args = Parser.parse_args()
 
     os.makedirs(Args.output_dir, exist_ok=True)
+    os.makedirs(os.path.join(Args.output_dir, 'debug'), exist_ok=True)
     num_features = int(Args.NumFeatures)
 
     """
@@ -66,7 +68,7 @@ def main():
 
             corners = cv2.goodFeaturesToTrack(
                 gray,
-                maxCorners=num_features * 2,
+                maxCorners=num_features * 4,
                 qualityLevel=0.01,
                 minDistance=20,
                 useHarrisDetector=True,
@@ -292,7 +294,7 @@ def main():
 
             # Ratio test + cross check
             forward = {}
-            ratio = 0.8
+            ratio = 0.85
             for m, n in matches12:
                 if m.distance < ratio * n.distance:
                     forward[m.queryIdx] = m.trainIdx
@@ -399,7 +401,7 @@ def main():
     #     H = np.linalg.inv(T2) @ H @ T1
     #     return H / H[2, 2]
 
-    def ransac_homography(matches, threshold=4.0, max_iters=2000):
+    def ransac_homography(matches, threshold=5.0, max_iters=3000):
         if len(matches) < 4:
             return None, None
 
@@ -409,7 +411,7 @@ def main():
         best_H = None
         best_mask = None
         best_inliers = 0
-        min_inliers = 8
+        min_inliers = 10
 
         for _ in range(max_iters):
             # Select 4 random pairs
@@ -571,47 +573,125 @@ def main():
         result = blended.astype(np.uint8)
 
         return result
+    def get_minimum_spanning_tree(vertices, edges):
+        parent = {v: v for v in vertices}
+        rank = {v: 0 for v in vertices}
+
+        def find(v):
+            if parent[v] != v:
+                parent[v] = find(parent[v])
+            return parent[v]
+
+        def union(v1, v2):
+            root1, root2 = find(v1), find(v2)
+            if root1 != root2:
+                if rank[root1] < rank[root2]:
+                    root1, root2 = root2, root1
+                parent[root2] = root1
+                if rank[root1] == rank[root2]:
+                    rank[root1] += 1
+
+        mst = []
+        sorted_edges = [(i, j, len(matches)) for i in edges for j, matches in edges[i].items()]
+        sorted_edges.sort(key=lambda x: x[2], reverse=True)
+
+        for v1, v2, _ in sorted_edges:
+            if find(v1) != find(v2):
+                union(v1, v2)
+                mst.append((v1, v2))
+
+        return mst
+
+    def draw_matches(img1, img2, matches):
+        h1, w1 = img1.shape[:2]
+        h2, w2 = img2.shape[:2]
+        vis = np.zeros((max(h1, h2), w1 + w2, 3), dtype=np.uint8)
+        vis[:h1, :w1] = img1
+        vis[:h2, w1:] = img2
+
+        for pt1, pt2 in matches:
+            pt1 = tuple(map(int, pt1))
+            pt2 = tuple(map(int, [pt2[0] + w1, pt2[1]]))
+            cv2.line(vis, pt1, pt2, (0, 255, 0), 1)
+            cv2.circle(vis, pt1, 2, (255, 0, 0), -1)
+            cv2.circle(vis, pt2, 2, (255, 0, 0), -1)
+        return vis
+
+    def draw_corners(img, corners):
+        vis = img.copy()
+        for x, y in corners:
+            cv2.circle(vis, (int(x), int(y)), 3, (0, 255, 0), -1)
+        return vis
 
     def create_panorama(images, num_features=1000):
-        # Use first image as anchor
-        panorama = images[0]
+        if len(images) < 2:
+            return images[0]
 
-        for i in range(1, len(images)):
-            # Double the features for better matching
-            corners, responses = detect_corners([panorama, images[i]], num_features * 2)
+        mid = len(images) // 2
+        panorama = images[mid]
+        processed = {mid}
 
-            if not corners or len(corners) < 2:
-                print(f"No corners detected in image {i}")
-                continue
+        for direction in [1, -1]:
+            curr_idx = mid
+            while True:
+                next_idx = curr_idx + direction
+                if next_idx < 0 or next_idx >= len(images):
+                    break
 
-            # Get more corners than default
-            all_anms_corners = []
-            for corners_i, response_i in zip(corners, responses):
-                anms_corners = adaptive_non_maximal_suppression(response_i, corners_i, num_features * 2)
-                all_anms_corners.append(anms_corners)
+                corners1, resp1 = detect_corners([panorama], num_features * 2)
+                corners2, resp2 = detect_corners([images[next_idx]], num_features * 2)
 
-            descriptors = []
-            valid_corners = []
-            for j, img in enumerate([panorama, images[i]]):
-                desc, v_corners = extract_features(img, all_anms_corners[j])
-                descriptors.append(desc)
-                valid_corners.append(v_corners)
+                if not corners1[0].size or not corners2[0].size:
+                    break
 
-            matches = match_features(descriptors[0], descriptors[1], valid_corners[0], valid_corners[1])
+                anms1 = adaptive_non_maximal_suppression(resp1[0], corners1[0], num_features)
+                anms2 = adaptive_non_maximal_suppression(resp2[0], corners2[0], num_features)
 
-            # Lower threshold for matches
-            if len(matches) < 8:
-                print(f"Only {len(matches)} matches found for image {i}")
-                continue
+                desc1, valid1 = extract_features(panorama, anms1)
+                desc2, valid2 = extract_features(images[next_idx], anms2)
 
-            H, mask = ransac_homography(matches, threshold=5.0, max_iters=3000)
-            if H is None:
-                print(f"Failed to find homography for image {i}")
-                continue
+                matches = match_features(desc1, desc2, valid1, valid2)
 
-            panorama = blend_images(panorama, images[i], H)
+                if len(matches) < 10:
+                    print(f"Too few matches between images {curr_idx} and {next_idx}")
+                    break
+
+                H, mask = ransac_homography(matches, threshold=5.0, max_iters=3000)
+                if H is None:
+                    print(f"Failed to find homography between images {curr_idx} and {next_idx}")
+                    break
+
+                if direction == 1:
+                    panorama = blend_images(panorama, images[next_idx], H)
+                else:
+                    H_inv = np.linalg.inv(H)
+                    panorama = blend_images(images[next_idx], panorama, H_inv)
+
+                processed.add(next_idx)
+                curr_idx = next_idx
+                cv2.imwrite(f'debug/pano_step_{len(processed)}.jpg', panorama)
+
+        if len(processed) < 2:
+            raise Exception("Failed to create panorama - insufficient image matches")
 
         return panorama
+
+    def poisson_blend(img1, img2, H):
+        # Convert to LAB colorspace
+        img1_lab = cv2.cvtColor(img1, cv2.COLOR_BGR2LAB)
+        img2_lab = cv2.cvtColor(img2, cv2.COLOR_BGR2LAB)
+
+        # Compute masks and centers
+        center = (output_shape[1] // 2, output_shape[0] // 2)
+
+        # Seamless cloning
+        try:
+            result = cv2.seamlessClone(img2_lab, img1_lab, mask, center, cv2.MIXED_CLONE)
+            return cv2.cvtColor(result, cv2.COLOR_LAB2BGR)
+        except cv2.error:
+            return img2
+
+
 
     # def blend_images(img1, img2, H):
     #
@@ -767,10 +847,11 @@ def main():
 
     # Create panorama
     # Create panorama
-    panorama = create_panorama(images, Args.NumFeatures)
-
-    # Save result
-    cv2.imwrite(os.path.join(Args.output_dir, 'panorama3.jpg'), panorama)
+    try:
+        panorama = create_panorama(images, Args.NumFeatures)
+        cv2.imwrite(os.path.join(Args.output_dir, 'final_panorama.jpg'), panorama)
+    except Exception as e:
+        print(f"Failed to create panorama: {e}")
 
     # # Initialize panorama
     # panorama = images[0]
