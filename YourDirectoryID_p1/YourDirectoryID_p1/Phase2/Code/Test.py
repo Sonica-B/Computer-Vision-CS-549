@@ -55,6 +55,7 @@ def StandardizeInputs(Img):
     ##########################################################################
     # Add any standardization or cropping/resizing if used in Training here!
     ##########################################################################
+    Img = np.float32(Img) / 255.0
     return Img
 
 
@@ -89,7 +90,12 @@ def TestOperation(ImageSize, ModelPath, TestSet, LabelsPathPred):
     Predictions written to /content/data/TxtFiles/PredOut.txt
     """
     # Predict output with forward pass, MiniBatchSize for Test is 1
-    model = CIFAR10Model(InputSize=3 * 32 * 32, OutputSize=10)
+    #model = CIFAR10Model(InputSize=3 * 32 * 32, OutputSize=10)
+    model = HomographyModel()
+
+    # Move to GPU if available
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    model = model.to(device)
 
     CheckPoint = torch.load(ModelPath)
     model.load_state_dict(CheckPoint["model_state_dict"])
@@ -102,9 +108,23 @@ def TestOperation(ImageSize, ModelPath, TestSet, LabelsPathPred):
     for count in tqdm(range(len(TestSet))):
         Img, Label = TestSet[count]
         Img, ImgOrg = ReadImages(Img)
-        PredT = torch.argmax(model(Img)).item()
 
-        OutSaveT.write(str(PredT) + "\n")
+        # Move to device
+        Img = torch.from_numpy(Img).to(device)
+        if Label is not None:
+            Label = torch.from_numpy(Label).to(device)
+
+        # Create batch for validation step
+        Batch = [Img, Img[:, :3], Img[:, 3:], None, Label]
+
+        with torch.no_grad():
+            result = model.validation_step(Batch)
+            val_loss = result["val_loss"]
+
+        #PredT = torch.argmax(model(Img)).item()####
+
+        #OutSaveT.write(str(PredT) + "\n") ####
+        OutSaveT.write(str(val_loss.cpu().numpy()) + "\n")
     OutSaveT.close()
 
 
@@ -196,13 +216,13 @@ def main():
     LabelsPath = Args.LabelsPath
 
     # Setup all needed parameters including file reading
-    ImageSize, DataPath = SetupAll(BasePath)
+    ImageSize = SetupAll()
 
     # Define PlaceHolder variables for Input and Predicted output
     ImgPH = tf.placeholder("float", shape=(1, ImageSize[0], ImageSize[1], 3))
     LabelsPathPred = "./TxtFiles/PredOut.txt"  # Path to save predicted labels
 
-    TestOperation(ImgPH, ImageSize, ModelPath, DataPath, LabelsPathPred)
+    TestOperation(ImageSize, ModelPath, DataPath, LabelsPathPred)
 
     # Plot Confusion Matrix
     LabelsTrue, LabelsPred = ReadLabels(LabelsPath, LabelsPathPred)

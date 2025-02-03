@@ -47,45 +47,105 @@ import string
 from termcolor import colored, cprint
 import math as m
 from tqdm import tqdm
+import json
+import torch.nn.functional as F
+from torchvision.transforms.functional import resize
 
+#
+# def GenerateBatch(BasePath, DirNamesTrain, TrainCoordinates, ImageSize, MiniBatchSize):
+#     """
+#     Inputs:
+#     BasePath - Path to COCO folder without "/" at the end
+#     DirNamesTrain - Variable with Subfolder paths to train files
+#     NOTE that Train can be replaced by Val/Test for generating batch corresponding to validation (held-out testing in this case)/testing
+#     TrainCoordinates - Coordinatess corresponding to Train
+#     NOTE that TrainCoordinates can be replaced by Val/TestCoordinatess for generating batch corresponding to validation (held-out testing in this case)/testing
+#     ImageSize - Size of the Image
+#     MiniBatchSize is the size of the MiniBatch
+#     Outputs:
+#     I1Batch - Batch of images
+#     CoordinatesBatch - Batch of coordinates
+#     """
+#     I1Batch = []
+#     CoordinatesBatch = []
+#
+#     ImageNum = 0
+#     while ImageNum < MiniBatchSize:
+#         # Generate random image
+#         RandIdx = random.randint(0, len(DirNamesTrain) - 1)
+#
+#         # RandImageName = BasePath + os.sep + DirNamesTrain[RandIdx] + ".jpg"
+#         # ImageNum += 1
+#
+#
+#         JsonFile = DirNamesTrain[RandIdx]
+#
+#         # Load JSON file
+#         JsonPath = os.path.join(BasePath, JsonFile + ".json")
+#         with open(JsonPath, 'r') as f:
+#             data = json.load(f)
+#
+#         # Randomly select an entry from the JSON file
+#         RandEntry = random.choice(data)
+#
+#         # Extract the stacked_input1 (image) and H4pt_input2 (coordinates)
+#         stacked_input1 = np.array(RandEntry['stacked_input1'], dtype=np.float32)
+#         H4pt_input2 = np.array(RandEntry['H4pt_input2'], dtype=np.float32)
+#
+#         # Resize the image to (128, 128, 6)
+#         stacked_input1_resized = resize(torch.from_numpy(stacked_input1).permute(2, 0, 1), ImageSize)
+#         stacked_input1_resized = stacked_input1_resized.permute(1, 2, 0).numpy()
+#
+#
+#         ##########################################################
+#         # Add any standardization or data augmentation here!
+#         ##########################################################
+#         # I1 = np.float32(cv2.imread(RandImageName))
+#         # Coordinates = TrainCoordinates[RandIdx]
+#
+#         # # Append All Images and Mask
+#         # I1Batch.append(torch.from_numpy(I1))
+#         # CoordinatesBatch.append(torch.tensor(Coordinates))
+#         # Append to batches
+#         I1Batch.append(torch.from_numpy(stacked_input1_resized))
+#         CoordinatesBatch.append(torch.from_numpy(H4pt_input2))
+#         ImageNum += 1
+#     return torch.stack(I1Batch), torch.stack(CoordinatesBatch)
 
 def GenerateBatch(BasePath, DirNamesTrain, TrainCoordinates, ImageSize, MiniBatchSize):
-    """
-    Inputs:
-    BasePath - Path to COCO folder without "/" at the end
-    DirNamesTrain - Variable with Subfolder paths to train files
-    NOTE that Train can be replaced by Val/Test for generating batch corresponding to validation (held-out testing in this case)/testing
-    TrainCoordinates - Coordinatess corresponding to Train
-    NOTE that TrainCoordinates can be replaced by Val/TestCoordinatess for generating batch corresponding to validation (held-out testing in this case)/testing
-    ImageSize - Size of the Image
-    MiniBatchSize is the size of the MiniBatch
-    Outputs:
-    I1Batch - Batch of images
-    CoordinatesBatch - Batch of coordinates
-    """
     I1Batch = []
     CoordinatesBatch = []
 
-    ImageNum = 0
-    while ImageNum < MiniBatchSize:
-        # Generate random image
-        RandIdx = random.randint(0, len(DirNamesTrain) - 1)
+    for _ in range(MiniBatchSize):
+        JsonFile = DirNamesTrain[0]
+        JsonPath = os.path.join(BasePath, JsonFile + ".json")
 
-        RandImageName = BasePath + os.sep + DirNamesTrain[RandIdx] + ".jpg"
-        ImageNum += 1
+        with open(JsonPath, 'r') as f:
+            data = json.load(f)
 
-        ##########################################################
-        # Add any standardization or data augmentation here!
-        ##########################################################
-        I1 = np.float32(cv2.imread(RandImageName))
-        Coordinates = TrainCoordinates[RandIdx]
+        RandKey = random.choice(list(data.keys()))
+        RandEntry = data[RandKey]
 
-        # Append All Images and Mask
-        I1Batch.append(torch.from_numpy(I1))
-        CoordinatesBatch.append(torch.tensor(Coordinates))
+        stacked_input1 = np.array(RandEntry['stacked_input1'], dtype=np.float32) / 255.0
+        H4pt_input2 = np.array(RandEntry['H4pt_input2'], dtype=np.float32)
+
+        # Convert to tensor with correct shape [C,H,W]
+        stacked_input1_tensor = torch.from_numpy(stacked_input1).permute(2, 0, 1)
+
+        # Resize to target size
+        stacked_input1_tensor = F.interpolate(
+            stacked_input1_tensor.unsqueeze(0),
+            size=(ImageSize[0], ImageSize[1]),
+            mode='bilinear',
+            align_corners=True
+        ).squeeze(0)
+
+        H4pt_tensor = torch.from_numpy(H4pt_input2)
+
+        I1Batch.append(stacked_input1_tensor)
+        CoordinatesBatch.append(H4pt_tensor)
 
     return torch.stack(I1Batch), torch.stack(CoordinatesBatch)
-
 
 def PrettyPrint(NumEpochs, DivTrain, MiniBatchSize, NumTrainSamples, LatestFile):
     """
@@ -134,20 +194,19 @@ def TrainOperation(
     Saves Trained network in CheckPointPath and Logs to LogsPath
     """
     # Predict output with forward pass
+    # Model setup
     model = HomographyModel()
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    model = model.to(device)
 
-    ###############################################
-    # Fill your optimizer of choice here!
-    ###############################################
-    Optimizer = ...
+    # Optimizer
+    Optimizer = torch.optim.Adam(model.parameters(), lr=1e-4)
 
     # Tensorboard
-    # Create a summary to monitor loss tensor
     Writer = SummaryWriter(LogsPath)
 
     if LatestFile is not None:
         CheckPoint = torch.load(CheckPointPath + LatestFile + ".ckpt")
-        # Extract only numbers from the name
         StartEpoch = int("".join(c for c in LatestFile.split("a")[0] if c.isdigit()))
         model.load_state_dict(CheckPoint["model_state_dict"])
         print("Loaded latest checkpoint with the name " + LatestFile + "....")
@@ -157,14 +216,33 @@ def TrainOperation(
 
     for Epochs in tqdm(range(StartEpoch, NumEpochs)):
         NumIterationsPerEpoch = int(NumTrainSamples / MiniBatchSize / DivTrain)
+        LossThisBatch = None  # Initialize LossThisBatch to None
+
+        # Debug: Print the number of iterations per epoch
+        print(f"Epoch {Epochs}: NumIterationsPerEpoch = {NumIterationsPerEpoch}")
+
         for PerEpochCounter in tqdm(range(NumIterationsPerEpoch)):
             I1Batch, CoordinatesBatch = GenerateBatch(
                 BasePath, DirNamesTrain, TrainCoordinates, ImageSize, MiniBatchSize
             )
 
+            # Debug shapes
+            print("Input batch shape:", I1Batch.shape)  # Should be [B, 6, 128, 128]
+
+            # Move to device
+            I1Batch = I1Batch.to(device)
+            CoordinatesBatch = CoordinatesBatch.to(device)
+
+            # Split into patches
+            patch_a = I1Batch[:, :3]  # [B,3,H,W]
+            patch_b = I1Batch[:, 3:]  # [B,3,H,W]
+            corners = CoordinatesBatch  # Coordinates [B, 8]
+
             # Predict output with forward pass
-            PredicatedCoordinatesBatch = model(I1Batch)
-            LossThisBatch = LossFn(PredicatedCoordinatesBatch, CoordinatesBatch)
+            Batch = [None, patch_a, patch_b, CoordinatesBatch]
+            #Batch = [I1Batch, patch_a, patch_b, corners]
+            result = model.validation_step(Batch)
+            LossThisBatch = result["val_loss"]
 
             Optimizer.zero_grad()
             LossThisBatch.backward()
@@ -172,7 +250,6 @@ def TrainOperation(
 
             # Save checkpoint every some SaveCheckPoint's iterations
             if PerEpochCounter % SaveCheckPoint == 0:
-                # Save the Model learnt in this epoch
                 SaveName = (
                     CheckPointPath
                     + str(Epochs)
@@ -192,29 +269,27 @@ def TrainOperation(
                 )
                 print("\n" + SaveName + " Model Saved...")
 
-            result = model.validation_step(Batch)
             # Tensorboard
             Writer.add_scalar(
                 "LossEveryIter",
                 result["val_loss"],
                 Epochs * NumIterationsPerEpoch + PerEpochCounter,
             )
-            # If you don't flush the tensorboard doesn't update until a lot of iterations!
             Writer.flush()
 
         # Save model every epoch
-        SaveName = CheckPointPath + str(Epochs) + "model.ckpt"
-        torch.save(
-            {
-                "epoch": Epochs,
-                "model_state_dict": model.state_dict(),
-                "optimizer_state_dict": Optimizer.state_dict(),
-                "loss": LossThisBatch,
-            },
-            SaveName,
-        )
-        print("\n" + SaveName + " Model Saved...")
-
+        if LossThisBatch is not None:  # Only save if LossThisBatch has been assigned a value
+            SaveName = CheckPointPath + str(Epochs) + "model.ckpt"
+            torch.save(
+                {
+                    "epoch": Epochs,
+                    "model_state_dict": model.state_dict(),
+                    "optimizer_state_dict": Optimizer.state_dict(),
+                    "loss": LossThisBatch,
+                },
+                SaveName,
+            )
+            print("\n" + SaveName + " Model Saved...")
 
 def main():
     """
@@ -227,7 +302,7 @@ def main():
     Parser = argparse.ArgumentParser()
     Parser.add_argument(
         "--BasePath",
-        default="/home/lening/workspace/rbe549/YourDirectoryID_p1/Phase2/Data",
+        default="D:\\WPI Assignments\\Computer Vision CS549\\YourDirectoryID_p1\\YourDirectoryID_p1\\Phase2\\Data\\",
         help="Base path of images, Default:/home/lening/workspace/rbe549/YourDirectoryID_p1/Phase2/Data",
     )
     Parser.add_argument(

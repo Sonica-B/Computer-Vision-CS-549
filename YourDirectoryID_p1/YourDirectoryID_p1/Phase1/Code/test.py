@@ -446,9 +446,9 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--NumFeatures', default=1000, type=int,
                         help='Number of features to detect')
-    parser.add_argument('--folder', default='../Data/Train/Set2',
+    parser.add_argument('--folder', default='../Data/Train/Set3',
                         help='Path to image folder')
-    parser.add_argument('--output_dir', default='Outputs/Set2',
+    parser.add_argument('--output_dir', default='Outputs/Set3',
                         help='Output directory')
     args = parser.parse_args()
 
@@ -478,8 +478,8 @@ def main():
     ransac_results = ransac_homography(matches, args.output_dir)
     visualize_ransac_results(ransac_results, images, args.output_dir)
 
-    #Pano
-    stitch_data = create_panorama(images,ransac_results, args.output_dir)
+    # #Pano
+    # stitch_data = create_panorama(images,ransac_results, args.output_dir)
 
 
 
