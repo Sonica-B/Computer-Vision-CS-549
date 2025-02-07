@@ -3,245 +3,366 @@ RBE/CS Fall 2022: Classical and Deep Learning Approaches for
 Geometric Computer Vision
 Project 1: MyAutoPano: Phase 2 Starter Code
 
-
 Author(s):
 Lening Li (lli4@wpi.edu)
 Teaching Assistant in Robotics Engineering,
 Worcester Polytechnic Institute
 """
-
-import torch.nn as nn
-import sys
+import pylab as pl
 import torch
-import numpy as np
+import torch.nn as nn
 import torch.nn.functional as F
+import sys
+import numpy as np
+import cv2
 import kornia  # You can use this to get the transform and warp in this project
+
 
 # Don't generate pyc codes
 sys.dont_write_bytecode = True
 
+def warp_perspective_opencv(image, H, output_size):
+    """
+    Warp an image using OpenCV's warpPerspective.
+    Inputs:
+        image: Input image (Batch x C x H x W) as a PyTorch tensor.
+        H: Homography matrix (Batch x 3 x 3) as a PyTorch tensor.
+        output_size: Tuple (height, width) of the output image.
+    Outputs:
+        warped: Warped image (Batch x C x H x W) as a PyTorch tensor.
+    """
+    batch_size, channels, height, width = image.shape
+    warped_images = []
 
-def tensor_DLT(delta, corners):
-    """Convert 4-point parametrization to homography matrix using DLT"""
-    batch_size = delta.shape[0]
-    device = delta.device
+    # Loop through each image in the batch
+    for i in range(batch_size):
+        # Convert PyTorch tensor to NumPy array
+        img_np = image[i].permute(1, 2, 0).cpu().numpy()  # (H, W, C)
+        H_np = H[i].cpu().numpy()  # (3, 3)
 
-    # Reshape corners and deltas
-    corners = corners.view(batch_size, 4, 2)
-    delta = delta.view(batch_size, 4, 2)
-    dst = corners + delta
-    src = corners
+        # Warp the image using OpenCV
+        warped_np = cv2.warpPerspective(
+            src=img_np,
+            M=H_np,
+            dsize=output_size,  # (width, height)
+            flags=cv2.INTER_LINEAR,
+            borderMode=cv2.BORDER_CONSTANT,
+            borderValue=0  # Fill with black
+        )
 
-    # Construct DLT matrix A
-    A = torch.zeros(batch_size, 8, 9, device=device)
-    for i in range(4):
-        x, y = src[:, i, 0], src[:, i, 1]
-        u, v = dst[:, i, 0], dst[:, i, 1]
-        A[:, i * 2] = torch.stack([x, y, torch.ones_like(x),
-                               torch.zeros_like(x), torch.zeros_like(x), torch.zeros_like(x),
-                               -x * u, -y * u, -u], dim=1)
-        A[:, i * 2 + 1] = torch.stack([torch.zeros_like(x), torch.zeros_like(x), torch.zeros_like(x),
-                                   x, y, torch.ones_like(x),
-                                   -x * v, -y * v, -v], dim=1)
+        # Convert back to PyTorch tensor
+        warped_tensor = torch.from_numpy(warped_np).permute(2, 0, 1)  # (C, H, W)
+        warped_images.append(warped_tensor)
 
-    # Solve using SVD
-    _, _, V = torch.svd(A)
-    H = V[:, :, -1].view(batch_size, 9)
-    H = H / H[:, 8].view(-1, 1)
-    H = H.view(batch_size, 3, 3)
-    return H
-
-
-def create_grid(h, w, device):
-    """Create normalized grid coordinates"""
-    y, x = torch.meshgrid(torch.arange(h, device=device), torch.arange(w, device=device))
-    grid = torch.stack([x, y], dim=2).float()
-    grid[:, :, 0] = 2.0 * grid[:, :, 0] / (w - 1) - 1.0
-    grid[:, :, 1] = 2.0 * grid[:, :, 1] / (h - 1) - 1.0
-    return grid
-
-
-def bilinear_sample(img, grid):
-    """Differentiable bilinear sampling"""
-    B, C, H, W = img.shape
-
-    # Normalize coordinates to [0, W-1/H-1]
-    x = ((grid[..., 0] + 1) / 2) * (W - 1)
-    y = ((grid[..., 1] + 1) / 2) * (H - 1)
-
-    # Get integer and fractional parts
-    x0 = torch.floor(x).long().clamp(0, W - 1)
-    y0 = torch.floor(y).long().clamp(0, H - 1)
-    x1 = (x0 + 1).clamp(0, W - 1)
-    y1 = (y0 + 1).clamp(0, H - 1)
-
-    # Get corner weights
-    wa = ((x1.float() - x) * (y1.float() - y)).unsqueeze(1)
-    wb = ((x1.float() - x) * (y - y0.float())).unsqueeze(1)
-    wc = ((x - x0.float()) * (y1.float() - y)).unsqueeze(1)
-    wd = ((x - x0.float()) * (y - y0.float())).unsqueeze(1)
-
-    # Get linear indices
-    idx_a = (y0 * W + x0).clamp(0, H * W - 1)
-    idx_b = (y0 * W + x1).clamp(0, H * W - 1)
-    idx_c = (y1 * W + x0).clamp(0, H * W - 1)
-    idx_d = (y1 * W + x1).clamp(0, H * W - 1)
-
-    # Gather and weight pixels
-    img_flat = img.view(B, C, -1)
-    output = (wa * torch.gather(img_flat, 2, idx_a.unsqueeze(1).expand(-1, C, -1)) +
-              wb * torch.gather(img_flat, 2, idx_b.unsqueeze(1).expand(-1, C, -1)) +
-              wc * torch.gather(img_flat, 2, idx_c.unsqueeze(1).expand(-1, C, -1)) +
-              wd * torch.gather(img_flat, 2, idx_d.unsqueeze(1).expand(-1, C, -1)))
-
-    return output.view(B, C, H, W)
-# def LossFn(delta, img_a, patch_b, corners):
-#     ###############################################
-#     # Fill your loss function of choice here!
-#     ###############################################
-#     # Get full homography matrix using DLT
-#     batch_size = delta.shape[0]
-#     H = tensor_DLT(delta, corners)
-#
-#     # Create sampling grid
-#     h, w = patch_b.shape[-2:]
-#     grid = create_grid(h, w, delta.device)
-#
-#     # Transform grid with homography
-#     points = grid.reshape(-1, 2)
-#     points = torch.cat([points, torch.ones(points.shape[0], 1, device=delta.device)], dim=1)
-#     warped_points = torch.matmul(H, points.t().unsqueeze(0))
-#     warped_points = warped_points.permute(0, 2, 1)
-#     warped_points = warped_points / (warped_points[..., 2:] + 1e-8)
-#     warped_points = warped_points[..., :2]
-#     warped_grid = warped_points.reshape(batch_size, h, w, 2)
-#
-#     # Sample from source image
-#     warped_a = bilinear_sample(img_a, warped_grid)
-#
-#     ###############################################
-#     # You can use kornia to get the transform and warp in this project
-#     # Bonus if you implement it yourself
-#     ###############################################
-#     loss = torch.mean(torch.abs(warped_a - patch_b)) #Calculate L1 photometric loss
-#     return loss
+    # Stack the warped images into a batch
+    warped = torch.stack(warped_images, dim=0)  # (Batch, C, H, W)
+    return warped
 
 def LossFn(delta, img_a, patch_b, corners):
-    # Compute homography
-    H = tensor_DLT(delta, corners)
-
-    # Create sampling grid
-    h, w = patch_b.shape[-2:]
-    grid = create_grid(h, w, delta.device)
-    grid = grid.unsqueeze(0).repeat(delta.shape[0], 1, 1, 1)
-
-    # Transform grid
-    ones = torch.ones(*grid.shape[:-1], 1, device=delta.device)
-    points = torch.cat([grid, ones], dim=-1)
-    points_t = points.reshape(delta.shape[0], -1, 3).transpose(1, 2)
-    warped_points = torch.bmm(H, points_t)
-    warped_points = warped_points.transpose(1, 2).reshape(delta.shape[0], h, w, 3)
-    warped_grid = warped_points[..., :2] / (warped_points[..., 2:] + 1e-8)
-
-    # Sample and compute loss
-    warped_a = bilinear_sample(img_a, warped_grid)
-    loss = torch.mean(torch.abs(warped_a - patch_b))
+    """
+    L2 Loss for homography estimation.
+    """
+    H4Pt_tilde = delta.reshape(-1, 8)
+    H4Pt = corners.reshape(-1, 8)
+    loss = torch.norm(H4Pt_tilde - H4Pt, p=2)
     return loss
 
-class Net(nn.Module):
+
+
+# class HomographyNet(nn.Module):
+#     def __init__(self):
+#         super(HomographyNet, self).__init__()
+#
+#         # Convolutional layers
+#         self.conv_layers = nn.Sequential(
+#             nn.Conv2d(6, 32, kernel_size=3, stride=1, padding=1),  # (128x128x32)
+#             nn.ReLU(),
+#             nn.MaxPool2d(2, stride=2),  # (64x64x32)
+#
+#             nn.Conv2d(32, 64, kernel_size=3, stride=1, padding=1),  # (64x64x64)
+#             nn.ReLU(),
+#             nn.MaxPool2d(2, stride=2),  # (32x32x64)
+#
+#             nn.Conv2d(64, 128, kernel_size=3, stride=1, padding=1),  # (32x32x128)
+#             nn.ReLU(),
+#             nn.MaxPool2d(2, stride=2),  # (16x16x128)
+#
+#             nn.Conv2d(128, 256, kernel_size=3, stride=1, padding=1),  # (16x16x256)
+#             nn.ReLU(),
+#             nn.MaxPool2d(2, stride=2),  # (8x8x256)
+#         )
+#
+#         # Fully connected layers
+#         self.fc_layers = nn.Sequential(
+#             nn.Linear(8 * 8 * 256, 512),
+#             nn.ReLU(),
+#             nn.Linear(512, 8)  # Output: H4Pt (8 values)
+#         )
+#
+#     def forward(self, xa, xb):
+#         """
+#         Forward pass for homography estimation.
+#         - xa: Image A (Batch x 128x128x3)
+#         - xb: Image B (Batch x 128x128x3)
+#         Returns:
+#         - Predicted H4Pt (Batch x 8)
+#         """
+#         # xa = np.array([xa])
+#         # xb = np.array([xb])
+#         # print(xa.shape, xb.shape)
+#         assert xa.shape[1:] == (128, 128, 3), "Input images must have shape (128, 128, 3) but is {} and {}".format(np.shape(xa), np.shape(xb))
+#         assert xb.shape[1:] == (128, 128, 3), "Input images must have shape (128, 128, 3) but is {} and {}".format(np.shape(xa), np.shape(xb))
+#
+#         # Concatenate along the channel dimension to form (Batch, 128, 128, 6)
+#         input_tensor = torch.cat((xa, xb), dim=-1)  # Concatenate along channel axis
+#         input_tensor = input_tensor.permute(0, 3, 1, 2).contiguous()  # Convert to (Batch, 6, 128, 128)
+#
+#         # Pass through convolutional layers
+#         features = self.conv_layers(input_tensor)
+#
+#         # Flatten features
+#         features = features.reshape(features.shape[0], -1)
+#
+#         # Predict homography
+#         out = self.fc_layers(features)
+#         return out
+#
+#
+# class HomographyModel(pl.LLightningModule):
+#     def __init__(self, hparams):
+#         super(HomographyModel, self).__init__()
+#         self.hparams = hparams
+#         self.model = HomographyNet(InputSize=6 * 128 * 128, OutputSize=8)
+#
+#     def forward(self, a, b):
+#         return self.model(a, b)
+#
+#     def training_step(self, batch, batch_idx):
+#         img_a, patch_a, patch_b, corners, gt = batch
+#         delta = self.model(patch_a, patch_b)
+#         loss = UnsupLossFn(delta, img_a, patch_b, corners)
+#         logs = {"loss": loss}
+#         return {"loss": loss, "log": logs}
+#
+#     def validation_step(self, batch, batch_idx):
+#         img_a, patch_a, patch_b, corners, gt = batch
+#         delta = self.model(patch_a, patch_b)
+#         loss = LossFn(delta, img_a, patch_b, corners)
+#         return {"val_loss": loss}
+#
+#     def validation_epoch_end(self, outputs):
+#         avg_loss = torch.stack([x["val_loss"] for x in outputs]).mean()
+#         logs = {"val_loss": avg_loss}
+#         return {"avg_val_loss": avg_loss, "log": logs}
+#
+
+
+
+
+# Unsupervised Model
+
+def UnsupLossFn(delta, img_a, patch_b, corners):
+    """
+    Compute the photometric loss for unsupervised homography estimation.
+    Inputs:
+        delta: Predicted H4Pt (Batch x 8)
+        img_a: Image A (Batch x 128x128x3)
+        patch_b: Image B (Batch x 128x128x3)
+        corners: Original corners of the patch (Batch x 4 x 2)
+    Outputs:
+        loss: Photometric loss (scalar)
+    """
+    # Compute homography matrix
+    H = UnsupervisedHomographyNet.get_homography(delta, corners)
+
+    # Compute photometric loss
+    loss = UnsupervisedHomographyNet.photometric_loss(img_a, patch_b, H)
+    return loss
+class TensorDLT(nn.Module):
+    def __init__(self):
+        super(TensorDLT, self).__init__()
+
+    def forward(self, src_pts, dst_pts):
+        """
+        Compute the homography matrix using the Direct Linear Transformation (DLT) method.
+        Inputs:
+            src_pts: Source points (original corners of the patch), shape (batch_size, 4, 2)
+            dst_pts: Destination points (predicted corners), shape (batch_size, 4, 2)
+        Outputs:
+            H: Homography matrix, shape (batch_size, 3, 3)
+        """
+        batch_size = src_pts.size(0)
+        A = torch.zeros((batch_size, 8, 9), device=src_pts.device, dtype=src_pts.dtype)
+
+        # Reshape points
+        src_pts = src_pts.view(-1, 4, 2)
+        dst_pts = dst_pts.view(-1, 4, 2)
+
+        # Create DLT matrix A
+        for i in range(4):
+            x, y = src_pts[:, i, 0], src_pts[:, i, 1]
+            u, v = dst_pts[:, i, 0], dst_pts[:, i, 1]
+
+            A[:, i * 2] = torch.stack([x, y, torch.ones_like(x), torch.zeros_like(x),
+                                       torch.zeros_like(x), torch.zeros_like(x),
+                                       -u * x, -u * y, -u], dim=1)
+
+            A[:, i * 2 + 1] = torch.stack([torch.zeros_like(x), torch.zeros_like(x),
+                                           torch.zeros_like(x), x, y, torch.ones_like(x),
+                                           -v * x, -v * y, -v], dim=1)
+
+        # Solve using SVD
+        _, _, V = torch.svd(A)
+        h = V[:, :, -1]
+        H = h.view(-1, 3, 3)
+
+        # Normalize homography
+        H = H / H[:, 2:3, 2:3]
+
+        return H
+
+
+class UnsupervisedHomographyNet(nn.Module):
     def __init__(self, InputSize, OutputSize):
         super().__init__()
-
-        # Input: [B,6,128,128]
-        self.features = nn.Sequential(
-            nn.Conv2d(6, 64, 3, padding=1),  # [B,64,128,128]
-            nn.BatchNorm2d(64),
-            nn.ReLU(inplace=True),
-            nn.MaxPool2d(2, 2)  # [B,64,64,64]
+        # Convolutional layers
+        self.conv_layers = nn.Sequential(
+            nn.Conv2d(6, 64, kernel_size=3, padding=1),
+            nn.ReLU(),
+            nn.MaxPool2d(2),
+            nn.Conv2d(64, 64, kernel_size=3, padding=1),
+            nn.ReLU(),
+            nn.MaxPool2d(2),
+            nn.Conv2d(64, 128, kernel_size=3, padding=1),
+            nn.ReLU(),
+            nn.MaxPool2d(2),
+            nn.Conv2d(128, 128, kernel_size=3, padding=1),
+            nn.ReLU()
         )
 
-        # Adjusted STN layers for correct dimensions
-        self.localization = nn.Sequential(
-            nn.Conv2d(64, 32, 3, padding=1),  # [B,32,64,64]
-            nn.MaxPool2d(2),  # [B,32,32,32]
-            nn.ReLU(True),
-            nn.Conv2d(32, 20, 3, padding=1),  # [B,20,32,32]
-            nn.MaxPool2d(2),  # [B,20,16,16]
-            nn.ReLU(True)
+        # Fully connected layers
+        self.fc_layers = nn.Sequential(
+            nn.Linear(128 * 32 * 32, 1024),
+            nn.ReLU(),
+            nn.Linear(1024, 8)  # Output: H4Pt (8 values)
         )
 
-        # 20 * 16 * 16 = 5120
-        self.fc_loc = nn.Sequential(
-            nn.Linear(5120, 32),
-            nn.ReLU(True),
-            nn.Linear(32, 6)
-        )
-
-        self.features2 = nn.Sequential(
-            nn.Conv2d(64, 128, 3, padding=1),
-            nn.BatchNorm2d(128),
-            nn.ReLU(inplace=True),
-            nn.MaxPool2d(2, 2),
-            nn.Conv2d(128, 256, 3, padding=1),
-            nn.BatchNorm2d(256),
-            nn.ReLU(inplace=True)
-        )
-
-        # 256 * 32 * 32 = 262144
-        self.regressor = nn.Sequential(
-            nn.Linear(262144, 1024),
-            nn.ReLU(True),
-            nn.Dropout(0.5),
-            nn.Linear(1024, OutputSize)
-        )
-
-        # Initialize STN weights
-        self.fc_loc[2].weight.data.zero_()
-        self.fc_loc[2].bias.data.copy_(torch.tensor([1, 0, 0, 0, 1, 0], dtype=torch.float))
-
-    def stn(self, x):
-        xs = self.localization(x)
-        xs = xs.view(-1, 20 * 16 * 16)  # Modified to match actual tensor size
-        theta = self.fc_loc(xs)
-        theta = theta.view(-1, 2, 3)
-        grid = F.affine_grid(theta, x.size(), align_corners=True)
-        x = F.grid_sample(x, grid, align_corners=True)
-        return x
+        # TensorDLT layer
+        self.dlt = TensorDLT()
 
     def forward(self, xa, xb):
-        x = torch.cat([xa, xb], dim=1)
-        print("Concatenated tensor shape:", x.shape)
-        x = self.features(x)
-        x = self.stn(x)
-        x = self.features2(x)
-        x = x.view(x.size(0), -1)
-        out = self.regressor(x)
-        return out
+        """
+        Forward pass for homography estimation.
+        Inputs:
+            xa: Image A (Batch x 128x128x3)
+            xb: Image B (Batch x 128x128x3)
+        Outputs:
+            delta: Predicted H4Pt (Batch x 8)
+        """
+        # Concatenate along the channel dimension to form (Batch, 128, 128, 6)
+        x = torch.cat((xa, xb), dim=-1)
+        x = x.permute(0, 3, 1, 2).float()  # Convert to (Batch, 6, 128, 128)
+
+        # Pass through convolutional layers
+        features = self.conv_layers(x)
+
+        # Flatten features
+        features = features.reshape(features.size(0), -1)
+
+        # Predict homography
+        delta = self.fc_layers(features)
+        return delta
+
+    def compute_loss(self, img_a, img_b, h4pt, corners):
+        # Convert H4pt to full homography
+        H = self.get_homography(h4pt, corners)
+
+        # Warp image A
+        warped_a = self.stn(img_a, H)
+
+        # Compute L1 photometric loss
+        loss = F.l1_loss(warped_a, img_b)
+
+        return loss
+
+    def get_homography(self, delta, corners):
+        """
+        Compute the homography matrix using TensorDLT.
+        Inputs:
+            delta: Predicted H4Pt (Batch x 8)
+            corners: Original corners of the patch (Batch x 4 x 2)
+        Outputs:
+            H: Homography matrix (Batch x 3 x 3)
+        """
+        batch_size = delta.shape[0]
+
+        # Reshape delta to (Batch x 4 x 2)
+        delta = delta.view(batch_size, 4, 2)
+
+        # Compute predicted corners
+        corners_pred = corners + delta
+
+        # Compute homography using TensorDLT
+        H = self.dlt(corners, corners_pred)
+        return H
+
+    def stn(self, x, H):
+        """
+        Spatial transformer network forward function for homography estimation.
+        Inputs:
+            x: Input image (Batch x C x H x W)
+            H: Homography matrix (Batch x 3 x 3)
+        Outputs:
+            warped: Warped image (Batch x C x H x W)
+        """
+        # Warp the image using OpenCV
+        warped = warp_perspective_opencv(x, H, (x.size(2), x.size(3)))
+        return warped
 
 
-class HomographyModel(nn.Module):
+class UnsupervisedHomographyModel(nn.Module):
     def __init__(self):
         super().__init__()
-        self.model = Net(InputSize=6 * 128 * 128, OutputSize=8)
+        self.model = UnsupervisedHomographyNet(InputSize=6 * 128 * 128, OutputSize=8)
 
-    def forward(self, patch_a, patch_b):
-        x = torch.cat([patch_a, patch_b], dim=1)
+    def forward(self, x):
         return self.model(x)
 
-    def training_step(self, batch):
-        patch_a = batch[1]  # [B,3,H,W]
-        patch_b = batch[2]  # [B,3,H,W]
-        corners = batch[3]  # [B,8]
+    def training_step(self, batch, batch_idx):
+        _, img_a, img_b, corners, _ = batch
+        H4pt = self.model(img_a, img_b)
+        loss = self.model.compute_loss(img_a, img_b, H4pt, corners)
+        return {"loss": loss}
 
-        delta = self.forward(patch_a, patch_b)
-        loss = LossFn(delta, patch_a, patch_b, corners)
-        return {'loss': loss}
+    def validation_step(self, batch, batch_idx=None):
+        _, img_a, img_b, corners, _ = batch
+        H4pt = self.model(img_a, img_b)
+        loss = self.model.compute_loss(img_a, img_b, H4pt, corners)
+        return {"val_loss": loss}
 
-    def validation_step(self, batch):
-        patch_a = batch[1]  # [B,3,H,W]
-        patch_b = batch[2]  # [B,3,H,W]
-        corners = batch[3]  # [B,8]
-
-        delta = self.forward(patch_a, patch_b)
-        loss = LossFn(delta, patch_a, patch_b, corners)
-        return {'val_loss': loss}
+# class UnsupervisedHomographyModel(nn.Module):
+#     def __init__(self):
+#         super(UnsupervisedHomographyModel, self).__init__()
+#         #self.hparams = hparams
+#         self.model = UnsupervisedHomographyNet(InputSize=6 * 128 * 128, OutputSize=8)
+#
+#     def forward(self, a, b):
+#         return self.model(a, b)
+#
+#     def training_step(self, batch, batch_idx):
+#         img_a, patch_a, patch_b, corners, gt = batch
+#         delta = self.model(patch_a, patch_b)
+#         loss = UnsupLossFn(delta, img_a, patch_b, corners)
+#         logs = {"loss": loss}
+#         return {"loss": loss, "log": logs}
+#
+#     def validation_step(self, batch, batch_idx):
+#         img_a, patch_a, patch_b, corners, gt = batch
+#         delta = self.model(patch_a, patch_b)
+#         loss = UnsupLossFn(delta, img_a, patch_b, corners)
+#         return {"val_loss": loss}
+#
+#     def validation_epoch_end(self, outputs):
+#         avg_loss = torch.stack([x["val_loss"] for x in outputs]).mean()
+#         logs = {"val_loss": avg_loss}
+#         return {"avg_val_loss": avg_loss, "log": logs}

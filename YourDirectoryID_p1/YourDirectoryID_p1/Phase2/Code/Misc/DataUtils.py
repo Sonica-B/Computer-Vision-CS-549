@@ -17,7 +17,6 @@ import random
 import skimage
 import PIL
 import sys
-import json
 
 # Don't generate pyc codes
 sys.dont_write_bytecode = True
@@ -38,29 +37,37 @@ def SetupAll(BasePath, CheckPointPath):
     NumClasses - Number of classes
     """
     # Setup DirNames
-    try:
-        DirNamesTrain = ['val__json']
-        train_json_path = os.path.join(BasePath, 'val__json.json')
-        if not os.path.exists(train_json_path):
-            raise FileNotFoundError(f"JSON file not found at {train_json_path}")
+    DirNamesTrain = SetupDirNames(BasePath)
 
-        with open(train_json_path, 'r') as f:
-            train_data = json.load(f)
+    # # Read and Setup Labels
+    # LabelsPathTrain = 'D:\\WPI Assignments\\Computer Vision CS549\\YourDirectoryID_p1\\YourDirectoryID_p1\\Phase2\\Code\\TxtFiles\\LabelsTest.txt'
+    # TrainLabels = ReadLabels(LabelsPathTrain)
+    TrainLabels = None
+    # If CheckPointPath doesn't exist make the path
+    if not (os.path.isdir(CheckPointPath)):
+        os.makedirs(CheckPointPath)
 
-        SaveCheckPoint = 100
-        ImageSize = [128, 128, 6]  # Changed to match network expectations
-        NumTrainSamples = len(train_data)
-        TrainLabels = None
-        NumClasses = None
+    # Save checkpoint every SaveCheckPoint iteration in every epoch, checkpoint saved automatically after every epoch
+    SaveCheckPoint = 100
+    # Number of passes of Val data with MiniBatchSize
+    NumTestRunsPerEpoch = 5
 
-        if not os.path.isdir(CheckPointPath):
-            os.makedirs(CheckPointPath)
+    # Image Input Shape
+    ImageSize = [32, 32, 3]
+    NumTrainSamples = len(DirNamesTrain)
+    print('NumTrainSamples: ', NumTrainSamples)
+    # Number of classes
+    NumClasses = 10
 
-        return DirNamesTrain, SaveCheckPoint, ImageSize, NumTrainSamples, TrainLabels, NumClasses
+    return (
+        DirNamesTrain,
+        SaveCheckPoint,
+        ImageSize,
+        NumTrainSamples,
+        TrainLabels,
+        NumClasses,
+    )
 
-    except Exception as e:
-        print(f"Error in SetupAll: {str(e)}")
-        sys.exit(1)
 
 def ReadLabels(LabelsPathTrain):
     if not (os.path.isfile(LabelsPathTrain)):
@@ -81,9 +88,10 @@ def SetupDirNames(BasePath):
     Outputs:
     Writes a file ./TxtFiles/DirNames.txt with full path to all image files without extension
     """
-    DirNamesTrain = ReadDirNames("./TxtFiles/DirNamesTrain.txt")
+    DirNamesTrain = ReadDirNames("D:\\WPI Assignments\\Computer Vision CS549\\YourDirectoryID_p1\\YourDirectoryID_p1\\Phase2\\Code\\TxtFiles\\DirNamesTrain.txt")
+    DirNamesVal = ReadDirNames("D:\\WPI Assignments\\Computer Vision CS549\\YourDirectoryID_p1\\YourDirectoryID_p1\\Phase2\\Code\\TxtFiles\\DirNamesVal.txt")
 
-    return DirNamesTrain
+    return DirNamesVal
 
 
 def ReadDirNames(ReadPath):
