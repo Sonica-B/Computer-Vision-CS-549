@@ -268,7 +268,7 @@ class CalibrationWrapper:
 
 def main():
     parser = argparse.ArgumentParser(description='Camera Calibration using Zhang\'s method')
-    parser.add_argument('--image_dir', type=str, default='../Data/Calibration_Imgs',
+    parser.add_argument('--image_dir', type=str, default='D:\\WPI Assignments\\Computer Vision CS549\\HW1\\Data\\Calibration_Imgs',
                         help='Directory containing calibration images')
     parser.add_argument('--output_dir', type=str, default='Outputs',
                         help='Directory to save results')

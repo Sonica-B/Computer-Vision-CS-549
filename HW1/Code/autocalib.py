@@ -48,7 +48,7 @@ class CameraCalibration:
 
     def find_corners(self, image: np.ndarray) -> Tuple[Optional[np.ndarray], bool]:
         """
-        Fast and robust corner detection optimized for Google Pixel XL images
+        Find checkerboard corners optimized for the assignment's pattern
         Args:
             image: Input image
         Returns:
@@ -58,43 +58,87 @@ class CameraCalibration:
         # Convert to grayscale if needed
         gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY) if len(image.shape) == 3 else image.copy()
 
-        # Resize if image is too large (speeds up detection)
-        height, width = gray.shape[:2]
-        max_dimension = 1000
-        if max(height, width) > max_dimension:
-            scale = max_dimension / max(height, width)
-            gray = cv2.resize(gray, None, fx=scale, fy=scale)
-
         # Basic preprocessing
-        # Normalize image to reduce lighting variations
+        # 1. Normalize image to reduce lighting variations
         gray = cv2.normalize(gray, None, 0, 255, cv2.NORM_MINMAX)
 
-        # Increase contrast
-        gray = cv2.convertScaleAbs(gray, alpha=1.2, beta=10)
+        # 2. Apply Gaussian blur to reduce noise
+        gray = cv2.GaussianBlur(gray, (17, 17), 0)
+        cv2.imwrite('debug_gray.jpg', gray)
+        # 3. Apply adaptive thresholding
+        thresh = cv2.adaptiveThreshold(gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+                                       cv2.THRESH_BINARY, 17, 2)
+       # _, thresh = cv2.threshold(gray, 120, 255, cv2.THRESH_BINARY)
 
-        # Find corners
-        ret, corners = cv2.findChessboardCorners(
-            gray,
-            self.pattern_size,
-            flags=cv2.CALIB_CB_ADAPTIVE_THRESH +
-                  cv2.CALIB_CB_NORMALIZE_IMAGE +
-                  cv2.CALIB_CB_FAST_CHECK
-        )
+        cv2.imwrite('debug_thresh.jpg', thresh)
+        # Important: pattern_size needs to be in (width, height) order for OpenCV
+        pattern_size = (self.pattern_size[1], self.pattern_size[0])  # Swap to (6,3)
 
-        if ret:
-            # If image was resized, scale corners back
-            if max(height, width) > max_dimension:
-                corners *= 1.0 / scale
-
-            # Refine corner positions
-            criteria = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 30, 0.001)
-            corners = cv2.cornerSubPix(
-                gray, corners, (11, 11), (-1, -1), criteria
+        # Try finding corners in both original and thresholded images
+        for img in [gray, thresh]:
+            ret, corners = cv2.findChessboardCorners(
+                img,
+                pattern_size,  # Note: Using swapped pattern size
+                flags=cv2.CALIB_CB_ADAPTIVE_THRESH +
+                      cv2.CALIB_CB_NORMALIZE_IMAGE +
+                      cv2.CALIB_CB_FAST_CHECK
             )
 
-            return corners, True
+            if ret and corners is not None and len(corners) > 0:
+                # Refine corners
+                corners = cv2.cornerSubPix(
+                    gray,
+                    corners,
+                    (17, 17),
+                    (-1, -1),
+                    (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 30, 0.001)
+                )
+                return corners, True
 
         return None, False
+
+    def verify_corner_positions(self, corners: np.ndarray) -> bool:
+        """
+        Verify that detected corners form a valid pattern
+        Args:
+            corners: Detected corner coordinates
+        Returns:
+            bool: Whether corners are valid
+        """
+        if corners is None or len(corners) != 18:  # 3x6 = 18 corners
+            return False
+
+        try:
+            # Reshape corners to grid (3 rows x 6 columns)
+            grid = corners.reshape(3, 6, 2)
+
+            # Check row and column spacing consistency
+            row_diffs = np.diff(grid, axis=0)
+            col_diffs = np.diff(grid, axis=1)
+
+            # Calculate distances between adjacent corners
+            row_distances = np.linalg.norm(row_diffs, axis=2)
+            col_distances = np.linalg.norm(col_diffs, axis=2)
+
+            # Calculate statistics
+            mean_row_dist = np.mean(row_distances)
+            mean_col_dist = np.mean(col_distances)
+            std_row = np.std(row_distances) / mean_row_dist  # Normalized std
+            std_col = np.std(col_distances) / mean_col_dist
+
+            # Thresholds for validity
+            max_std = 0.2  # Maximum allowed normalized standard deviation
+            min_dist = 10  # Minimum distance between corners in pixels
+
+            # Check if spacing is consistent and large enough
+            if (std_row > max_std or std_col > max_std or
+                    mean_row_dist < min_dist or mean_col_dist < min_dist):
+                return False
+
+            return True
+
+        except:
+            return False
 
     def draw_corners(self, image: np.ndarray, corners: np.ndarray) -> np.ndarray:
         """
