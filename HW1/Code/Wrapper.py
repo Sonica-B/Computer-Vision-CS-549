@@ -1,11 +1,7 @@
 import argparse
-from pathlib import Path
 import logging
-import cv2
-import numpy as np
-from datetime import datetime
-import matplotlib.pyplot as plt
-from autocalib import CameraCalibration
+from pathlib import Path
+from autocalib import *
 
 
 class CalibrationWrapper:
@@ -72,8 +68,6 @@ class CalibrationWrapper:
                      t=result.t,
                      error=result.reprojection_error)
 
-            # Generate report
-            self._generate_report(result)
 
             self.logger.info(f"""
             Calibration completed successfully:
@@ -88,30 +82,6 @@ class CalibrationWrapper:
             self.logger.error(f"Calibration failed: {str(e)}")
             raise
 
-    def _generate_report(self, result):
-        report_path = self.output_dir / 'Report.tex'
-        with open(report_path, 'w') as f:
-            f.write(r'\documentclass[conference]{IEEEtran}' + '\n')
-            f.write(r'\usepackage{graphicx}' + '\n')
-            f.write(r'\begin{document}' + '\n\n')
-
-            # Add calibration results
-            f.write(r'\section{Camera Calibration Results}' + '\n')
-            f.write(r'\subsection{Camera Matrix}' + '\n')
-            f.write(r'\[ K = \begin{bmatrix}' + '\n')
-            for i in range(3):
-                row = ' & '.join([f'{x:.2f}' for x in result.K[i]])
-                f.write(row + r' \\' + '\n')
-            f.write(r'\end{bmatrix} \]' + '\n\n')
-
-            f.write(r'\subsection{Distortion Coefficients}' + '\n')
-            f.write(f'k1 = {result.k[0]:.6f}\n\n')
-            f.write(f'k2 = {result.k[1]:.6f}\n\n')
-
-            f.write(r'\subsection{Reprojection Error}' + '\n')
-            f.write(f'Mean error: {result.reprojection_error:.4f} pixels\n\n')
-
-            f.write(r'\end{document}')
 
 def main():
     parser = argparse.ArgumentParser(description='Camera Calibration using Zhang\'s method')
