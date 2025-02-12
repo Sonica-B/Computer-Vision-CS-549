@@ -13,16 +13,8 @@ class CalibrationWrapper:
         self.image_dir = Path(image_dir)
         self.output_dir = Path(output_dir)
         self.output_dir.mkdir(parents=True, exist_ok=True)
-        self.square_size = square_size
-
-        # Setup logging
+        self.calibrator = CameraCalibration(square_size=square_size)
         self._setup_logger()
-
-        # Initialize calibrator
-        self.calibrator = CameraCalibration(
-            square_size=square_size,
-            pattern_size=(7, 8)  # Full pattern size including outer squares
-        )
 
     def _setup_logger(self):
         log_file = self.output_dir / 'calibration.log'
@@ -37,69 +29,11 @@ class CalibrationWrapper:
         )
         self.logger = logging.getLogger("CalibrationWrapper")
 
-    def save_visualization(self, image: np.ndarray, corners: np.ndarray, idx: int):
-        """Save corner detection visualization"""
-        vis = image.copy()
-        cv2.drawChessboardCorners(vis, (6, 7), corners, True)
-        cv2.imwrite(str(self.output_dir / f'corners_{idx:02d}.jpg'), vis)
-
-    def generate_report(self, result) -> None:
-        """Generate IEEE format calibration report"""
-        report_dir = self.output_dir / 'report'
-        report_dir.mkdir(exist_ok=True)
-
-        with open(report_dir / 'Report.tex', 'w') as f:
-            f.write(r'\documentclass[conference]{IEEEtran}' + '\n')
-            f.write(r'\usepackage{graphicx,amsmath}' + '\n')
-            f.write(r'\begin{document}' + '\n\n')
-
-            # Title
-            f.write(r'\title{Camera Calibration Results}' + '\n')
-            f.write(r'\maketitle' + '\n\n')
-
-            # Calibration Matrix
-            f.write(r'\section{Camera Parameters}' + '\n')
-            f.write(r'\subsection{Intrinsic Matrix}' + '\n')
-            f.write(r'\begin{equation*}' + '\n')
-            f.write(r'K = \begin{bmatrix}' + '\n')
-            for i in range(3):
-                f.write(' & '.join(f'{x:.2f}' for x in result.K[i]))
-                f.write(r' \\' + '\n')
-            f.write(r'\end{bmatrix}' + '\n')
-            f.write(r'\end{equation*}' + '\n\n')
-
-            # Distortion Coefficients
-            f.write(r'\subsection{Distortion Coefficients}' + '\n')
-            f.write(r'\begin{equation*}' + '\n')
-            f.write(r'k = [k_1, k_2] = [' + f'{result.k[0]:.6f}, {result.k[1]:.6f}]' + '\n')
-            f.write(r'\end{equation*}' + '\n\n')
-
-            # Error Analysis
-            f.write(r'\section{Calibration Quality}' + '\n')
-            f.write(r'\subsection{Reprojection Errors}' + '\n')
-            f.write(f'Mean reprojection error: {result.reprojection_error:.4f} pixels\n\n')
-
-            f.write(r'\end{document}')
-
-        # Save visualization plots
-        plt.figure(figsize=(10, 5))
-        plt.plot(result.per_view_errors, '-bo')
-        plt.title('Reprojection Error by Image')
-        plt.xlabel('Image Index')
-        plt.ylabel('RMS Error (pixels)')
-        plt.grid(True)
-        plt.savefig(report_dir / 'reprojection_errors.pdf')
-        plt.close()
-
     def run_calibration(self):
-        """Run Zhang's calibration pipeline"""
         try:
             # Load images
-            image_paths = sorted(self.image_dir.glob('*.jpg'))
-            if not image_paths:
-                raise ValueError(f"No images found in {self.image_dir}")
-
             images = []
+            image_paths = sorted(self.image_dir.glob('*.jpg'))
             for path in image_paths:
                 img = cv2.imread(str(path))
                 if img is not None:
@@ -107,16 +41,16 @@ class CalibrationWrapper:
 
             self.logger.info(f"Loaded {len(images)} images")
 
-            # Create debug directory
+            # Debug directory for visualizations
             debug_dir = self.output_dir / 'debug'
             debug_dir.mkdir(exist_ok=True)
 
-            # Debug: Save corner detection results
+            # Test corner detection
             for i, img in enumerate(images):
                 corners, ret = self.calibrator.find_corners(img)
                 if ret:
                     vis = img.copy()
-                    cv2.drawChessboardCorners(vis, (7, 6), corners, True)
+                    cv2.drawChessboardCorners(vis, (6, 7), corners, True)
                     cv2.imwrite(str(debug_dir / f'corners_{i:02d}.jpg'), vis)
                     self.logger.info(f"Found corners in image {i}")
                 else:
@@ -139,10 +73,10 @@ class CalibrationWrapper:
                      error=result.reprojection_error)
 
             # Generate report
-            self.generate_report(result)
+            self._generate_report(result)
 
             self.logger.info(f"""
-            Calibration completed:
+            Calibration completed successfully:
             - Processed {len(images)} images
             - Final reprojection error: {result.reprojection_error:.4f} pixels
             - Results saved to {self.output_dir}
@@ -153,6 +87,31 @@ class CalibrationWrapper:
         except Exception as e:
             self.logger.error(f"Calibration failed: {str(e)}")
             raise
+
+    def _generate_report(self, result):
+        report_path = self.output_dir / 'Report.tex'
+        with open(report_path, 'w') as f:
+            f.write(r'\documentclass[conference]{IEEEtran}' + '\n')
+            f.write(r'\usepackage{graphicx}' + '\n')
+            f.write(r'\begin{document}' + '\n\n')
+
+            # Add calibration results
+            f.write(r'\section{Camera Calibration Results}' + '\n')
+            f.write(r'\subsection{Camera Matrix}' + '\n')
+            f.write(r'\[ K = \begin{bmatrix}' + '\n')
+            for i in range(3):
+                row = ' & '.join([f'{x:.2f}' for x in result.K[i]])
+                f.write(row + r' \\' + '\n')
+            f.write(r'\end{bmatrix} \]' + '\n\n')
+
+            f.write(r'\subsection{Distortion Coefficients}' + '\n')
+            f.write(f'k1 = {result.k[0]:.6f}\n\n')
+            f.write(f'k2 = {result.k[1]:.6f}\n\n')
+
+            f.write(r'\subsection{Reprojection Error}' + '\n')
+            f.write(f'Mean error: {result.reprojection_error:.4f} pixels\n\n')
+
+            f.write(r'\end{document}')
 
 def main():
     parser = argparse.ArgumentParser(description='Camera Calibration using Zhang\'s method')
