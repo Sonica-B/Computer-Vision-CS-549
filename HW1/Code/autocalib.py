@@ -18,7 +18,8 @@ class CameraCalibration:
     def __init__(self, square_size: float = 21.5):
         self.square_size = square_size
         self.K = None
-        self.k = np.zeros(2)
+        # self.k = np.zeros(2)
+        self.k = np.zeros((5, 1), dtype=np.float32)
         self.R = []
         self.t = []
 
@@ -30,7 +31,7 @@ class CameraCalibration:
         gray = cv2.GaussianBlur(gray, (5, 5), 0)
 
         # Find corners (6x7 inner corners)
-        pattern_size = (6, 7)  # width x height of inner corners
+        pattern_size = (9, 6)  # width x height of inner corners
         ret, corners = cv2.findChessboardCorners(
             gray, pattern_size,
             flags=(cv2.CALIB_CB_ADAPTIVE_THRESH +
@@ -46,8 +47,10 @@ class CameraCalibration:
         return None, False
 
     def create_object_points(self) -> np.ndarray:
-        objp = np.zeros((6 * 7, 3), np.float32)
-        objp[:, :2] = np.mgrid[0:6, 0:7].T.reshape(-1, 2)
+        # objp = np.zeros((6 * 7, 3), np.float32)
+        # objp[:, :2] = np.mgrid[0:6, 0:7].T.reshape(-1, 2)
+        objp = np.zeros((9 * 6, 3), np.float32)  # Adjusted for correct pattern size
+        objp[:, :2] = np.mgrid[0:9, 0:6].T.reshape(-1, 2)
         objp *= self.square_size
         return objp
 
@@ -67,12 +70,13 @@ class CameraCalibration:
 
         # Initial calibration
         ret, mtx, dist, rvecs, tvecs = cv2.calibrateCamera(
-            object_points, image_points, images[0].shape[::-1], None, None,
+            object_points, image_points, (images[0].shape[1], images[0].shape[0]), None, None,  # images[0].shape[::-1]
             flags=cv2.CALIB_RATIONAL_MODEL)
 
         # Refine with optimization
         self.K = mtx
-        self.k = dist[:2]
+        # self.k = dist[:2]
+        self.k = dist.flatten()  # Ensure 1D array of all coefficients
         self.R = [cv2.Rodrigues(r)[0] for r in rvecs]
         self.t = tvecs
 
@@ -82,7 +86,10 @@ class CameraCalibration:
         for i in range(len(object_points)):
             imgpoints2, _ = cv2.projectPoints(
                 object_points[i], rvecs[i], tvecs[i], mtx, dist)
-            error = cv2.norm(image_points[i], imgpoints2.reshape(-1, 2))
+           # error = cv2.norm(image_points[i], imgpoints2.reshape(-1, 2))
+            error = cv2.norm(image_points[i].reshape(-1, 2).astype(np.float32),
+                             imgpoints2.reshape(-1, 2).astype(np.float32))
+
             per_view_errors.append(error)
             total_error += error
 
@@ -95,10 +102,19 @@ class CameraCalibration:
             per_view_errors=per_view_errors
         )
 
+    # def undistort_image(self, image: np.ndarray) -> np.ndarray:
+    #     h, w = image.shape[:2]
+    #     # newcameramtx, roi = cv2.getOptimalNewCameraMatrix(
+    #     #     self.K, np.hstack((self.k, [0, 0, 0])), (w, h), 1, (w, h))
+    #     newcameramtx, roi = cv2.getOptimalNewCameraMatrix(self.K, self.k.reshape(-1, 1), (w, h), 1, (w, h))
+    #
+    #     dst = cv2.undistort(image, self.K, np.hstack((self.k, [0, 0, 0])), None, newcameramtx)
+    #     x, y, w, h = roi
+    #     return dst[y:y + h, x:x + w]
     def undistort_image(self, image: np.ndarray) -> np.ndarray:
         h, w = image.shape[:2]
-        newcameramtx, roi = cv2.getOptimalNewCameraMatrix(
-            self.K, np.hstack((self.k, [0, 0, 0])), (w, h), 1, (w, h))
-        dst = cv2.undistort(image, self.K, np.hstack((self.k, [0, 0, 0])), None, newcameramtx)
+        # Use self.k directly (already has correct coefficients)
+        newcameramtx, roi = cv2.getOptimalNewCameraMatrix(self.K, self.k, (w, h), 1, (w, h))
+        dst = cv2.undistort(image, self.K, self.k, None, newcameramtx)
         x, y, w, h = roi
         return dst[y:y + h, x:x + w]
