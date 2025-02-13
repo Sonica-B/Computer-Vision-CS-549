@@ -68,10 +68,10 @@ class CameraCalibration:
             pattern_size: Size of the checkerboard pattern (inner corners)
 
         Returns:
-            3D object points array with shape (N,3) in float64 format
+            3D object points array in float32 format
         """
         # Create the object points grid
-        objp = np.zeros((pattern_size[0] * pattern_size[1], 3), dtype=np.float64)
+        objp = np.zeros((pattern_size[0] * pattern_size[1], 3), dtype=np.float32)
 
         # Fill in X,Y coordinates
         mgrid = np.mgrid[0:pattern_size[0], 0:pattern_size[1]].T
@@ -80,8 +80,8 @@ class CameraCalibration:
         # Scale by square size
         objp *= self.square_size
 
-        # Ensure array is contiguous
-        objp = np.ascontiguousarray(objp)
+        # Ensure array is contiguous and float32
+        objp = np.ascontiguousarray(objp, dtype=np.float32)
 
         return objp
 
@@ -132,171 +132,158 @@ class CameraCalibration:
 
     def calibrate(self, images: List[np.ndarray], pattern_size: Tuple[int, int] = (9, 6)) -> CalibrationResult:
         """
-        Perform camera calibration using Zhang's method.
-
-        Args:
-            images: List of calibration images
-            pattern_size: Size of the checkerboard pattern
-
-        Returns:
-            CalibrationResult object containing all calibration parameters
+        Perform camera calibration using Zhang's method with improved handling of distortion.
         """
-        # Collect corner points and estimate homographies
+        # Collect corner points
         object_points = []
         image_points = []
-        homographies = []
         objp = self.create_object_points(pattern_size)
 
         for img in images:
             corners, found = self.find_corners(img, pattern_size)
             if found:
-                object_points.append(objp)
-                image_points.append(corners)
-                H = self.estimate_homography(objp, corners.reshape(-1, 2))
-                homographies.append(H)
+                # Ensure object points are in the correct format for each image
+                object_points.append(objp.astype(np.float32))
+                # Ensure image points are in the correct format
+                image_points.append(corners.astype(np.float32))
 
-        if len(homographies) < 2:
+        if len(object_points) < 2:
             raise ValueError("At least 2 valid calibration images required")
 
-        # Initial parameter estimation using Zhang's method
-        V = np.zeros((2 * len(homographies), 6))
-        for i, H in enumerate(homographies):
-            h1, h2 = H[:, 0], H[:, 1]
-            V[2 * i] = [h1[0] * h2[0], h1[0] * h2[1] + h1[1] * h2[0], h1[1] * h2[1],
-                        h1[2] * h2[0] + h1[0] * h2[2], h1[2] * h2[1] + h1[1] * h2[2], h1[2] * h2[2]]
-            V[2 * i + 1] = [h1[0] * h1[0] - h2[0] * h2[0],
-                            2 * (h1[0] * h1[1] - h2[0] * h2[1]),
-                            h1[1] * h1[1] - h2[1] * h2[1],
-                            2 * (h1[0] * h1[2] - h2[0] * h2[2]),
-                            2 * (h1[1] * h1[2] - h2[1] * h2[2]),
-                            h1[2] * h1[2] - h2[2] * h2[2]]
+        # Get image size (width, height)
+        h, w = images[0].shape[:2]
+        image_size = (w, h)  # OpenCV expects (width, height)
 
-        # Solve Vb = 0
-        _, _, Vh = np.linalg.svd(V)
-        b = Vh[-1]
+        # Convert lists to numpy arrays of the correct type
+        object_points = np.array(object_points, dtype=np.float32)
+        image_points = np.array(image_points, dtype=np.float32)
 
-        # Extract intrinsic parameters
-        B11, B12, B22, B13, B23, B33 = b
-        v0 = (B12 * B13 - B11 * B23) / (B11 * B22 - B12 * B12)
-        lambda_ = B33 - (B13 * B13 + v0 * (B12 * B13 - B11 * B23)) / B11
-        alpha = np.sqrt(lambda_ / B11)
-        beta = np.sqrt(lambda_ * B11 / (B11 * B22 - B12 * B12))
-        gamma = -B12 * alpha * alpha / lambda_
-        u0 = gamma * v0 / beta - B13 * alpha * alpha / lambda_
+        # Initial calibration with OpenCV to get a stable starting point
+        flags = (cv2.CALIB_RATIONAL_MODEL +
+                 cv2.CALIB_FIX_K3 +
+                 cv2.CALIB_FIX_K4 +
+                 cv2.CALIB_FIX_K5 +
+                 cv2.CALIB_FIX_K6)
 
-        # Initialize camera matrix
-        self.K = np.array([[alpha, gamma, u0],
-                           [0, beta, v0],
-                           [0, 0, 1]], dtype=np.float64)
+        ret, mtx, dist, rvecs, tvecs = cv2.calibrateCamera(
+            object_points,
+            image_points,
+            image_size,  # Pass as (width, height)
+            None,
+            None,
+            flags=flags
+        )
 
-        # Calculate extrinsic parameters for each view
-        self.R = []
-        self.t = []
-        for H in homographies:
-            h1, h2, h3 = H[:, 0], H[:, 1], H[:, 2]
-            lambda_ = 1 / np.linalg.norm(np.linalg.inv(self.K) @ h1)
+        # Initialize our parameters with OpenCV results
+        self.K = mtx
+        self.k = dist[:2].reshape(-1, 1)  # Take only k1, k2
+        self.R = [cv2.Rodrigues(r)[0] for r in rvecs]
+        self.t = [t for t in tvecs]
 
-            r1 = lambda_ * np.linalg.inv(self.K) @ h1
-            r2 = lambda_ * np.linalg.inv(self.K) @ h2
-            r3 = np.cross(r1, r2)
+        # Convert object_points and image_points back to list format for refine_parameters
+        object_points = list(object_points)
+        image_points = list(image_points)
 
-            R = np.column_stack([r1, r2, r3])
-            U, _, Vt = np.linalg.svd(R)
-            R = U @ Vt
-
-            t = lambda_ * np.linalg.inv(self.K) @ h3
-
-            self.R.append(R)
-            self.t.append(t.reshape(3, 1))
-
-        # Refine all parameters through optimization
+        # Refine parameters using Zhang's method
         return self.refine_parameters(object_points, image_points)
 
     def refine_parameters(self, object_points: List[np.ndarray], image_points: List[np.ndarray]) -> CalibrationResult:
         """
-        Refine calibration parameters using maximum likelihood estimation.
-        Added proper convergence criteria and bounds to prevent infinite loops.
+        Refine calibration parameters with improved optimization settings.
         """
 
         def compute_residuals(params):
-            """Compute reprojection error for optimization."""
-            K_new = np.array([[params[0], params[1], params[2]],
-                              [0, params[3], params[4]],
+            K_new = np.array([[params[0], 0, params[2]],
+                              [0, params[1], params[3]],
                               [0, 0, 1]], dtype=np.float64)
 
-            # Use first two distortion coefficients only for stability
-            k_new = np.array([[params[5], params[6], 0., 0., 0.]], dtype=np.float64)
+            k_new = np.array([[params[4], params[5], 0., 0., 0.]], dtype=np.float64)
 
             residuals = []
-            param_idx = 7
+            param_idx = 6
 
             for i in range(len(object_points)):
                 obj_pts = np.ascontiguousarray(object_points[i], dtype=np.float64)
-                rvec = np.array(params[param_idx:param_idx + 3], dtype=np.float64).reshape(3, 1)
-                tvec = np.array(params[param_idx + 3:param_idx + 6], dtype=np.float64).reshape(3, 1)
+                rvec = params[param_idx:param_idx + 3].reshape(3, 1)
+                tvec = params[param_idx + 3:param_idx + 6].reshape(3, 1)
                 param_idx += 6
 
                 try:
-                    proj_points, _ = cv2.projectPoints(
-                        objectPoints=obj_pts,
-                        rvec=rvec,
-                        tvec=tvec,
-                        cameraMatrix=K_new,
-                        distCoeffs=k_new
-                    )
-                    img_pts = image_points[i].reshape(-1, 2).astype(np.float64)
-                    current_residuals = (img_pts - proj_points.reshape(-1, 2)).ravel()
-                    residuals.extend(current_residuals)
+                    proj_points, _ = cv2.projectPoints(obj_pts, rvec, tvec, K_new, k_new)
+                    img_pts = image_points[i].reshape(-1, 2)
+                    error = (img_pts - proj_points.reshape(-1, 2)).ravel()
+                    residuals.extend(error)
                 except Exception as e:
-                    print(f"Error in projectPoints: {str(e)}")
-                    # Return large residuals on error to guide optimization away
-                    residuals.extend([1000.0] * (object_points[i].shape[0] * 2))
+                    print(f"Warning: Error in projection for image {i}: {str(e)}")
+                    # Return large error to guide optimization away from invalid solutions
+                    residuals.extend([1000.0] * (obj_pts.shape[0] * 2))
 
             return np.array(residuals, dtype=np.float64)
 
-        # Initialize parameters
+        # Initialize with current estimates
         initial_params = [
-            self.K[0, 0], self.K[0, 1], self.K[0, 2],  # K matrix elements
-            self.K[1, 1], self.K[1, 2],  # K matrix elements
-            0.0, 0.0  # Initial distortion coefficients (k1, k2)
+            self.K[0, 0],  # fx
+            self.K[1, 1],  # fy
+            self.K[0, 2],  # cx
+            self.K[1, 2],  # cy
+            float(self.k[0, 0]),  # k1
+            float(self.k[1, 0])  # k2
         ]
 
         # Add extrinsic parameters
         for R, t in zip(self.R, self.t):
-            rvec, _ = cv2.Rodrigues(R.astype(np.float64))
+            rvec, _ = cv2.Rodrigues(R)
             initial_params.extend(rvec.ravel())
             initial_params.extend(t.ravel())
 
         initial_params = np.array(initial_params, dtype=np.float64)
 
+        # Get image dimensions from first image points
+        h, w = image_points[0].shape[1::-1]
+
+        # Set optimization bounds
+        lower_bounds = [-np.inf] * len(initial_params)
+        upper_bounds = [np.inf] * len(initial_params)
+
+        # Constrain focal lengths to be positive and reasonable
+        lower_bounds[0:2] = [0.3 * max(w, h)] * 2
+        upper_bounds[0:2] = [3.0 * max(w, h)] * 2
+
+        # Constrain principal point to image center ± 20%
+        lower_bounds[2:4] = [0.4 * w, 0.4 * h]
+        upper_bounds[2:4] = [0.6 * w, 0.6 * h]
+
+        # Constrain distortion coefficients
+        lower_bounds[4:6] = [-0.5, -0.5]
+        upper_bounds[4:6] = [0.5, 0.5]
+
         try:
-            # Run optimization with proper parameters
+            # Run optimization
             result = least_squares(
                 compute_residuals,
                 initial_params,
-                method='lm',  # Levenberg-Marquardt algorithm
-                ftol=1e-8,  # Function tolerance
-                xtol=1e-8,  # Parameter tolerance
-                gtol=1e-8,  # Gradient tolerance
-                max_nfev=1000,  # Maximum number of function evaluations
-                verbose=1  # Reduced verbosity
+                bounds=(lower_bounds, upper_bounds),
+                method='trf',
+                loss='huber',
+                ftol=1e-8,
+                xtol=1e-8,
+                max_nfev=200,
+                verbose=1
             )
-
-            if not result.success:
-                print(f"Warning: Optimization did not converge: {result.message}")
 
             optimized_params = result.x
 
             # Update parameters
-            self.K = np.array([[optimized_params[0], optimized_params[1], optimized_params[2]],
-                               [0, optimized_params[3], optimized_params[4]],
-                               [0, 0, 1]], dtype=np.float64)
+            self.K = np.array([
+                [optimized_params[0], 0, optimized_params[2]],
+                [0, optimized_params[1], optimized_params[3]],
+                [0, 0, 1]
+            ], dtype=np.float64)
 
-            # Update distortion coefficients (k1, k2 only)
-            self.k = np.array([[optimized_params[5], optimized_params[6], 0., 0., 0.]], dtype=np.float64).T
+            self.k = np.array([[optimized_params[4], optimized_params[5], 0., 0., 0.]], dtype=np.float64).T
 
             # Update extrinsic parameters
-            param_idx = 7
+            param_idx = 6
             self.R = []
             self.t = []
             for _ in range(len(object_points)):
@@ -308,7 +295,7 @@ class CameraCalibration:
                 self.R.append(R)
                 self.t.append(tvec)
 
-            # Calculate errors
+            # Calculate final errors
             residuals = compute_residuals(optimized_params)
             total_error = np.sqrt(np.mean(residuals ** 2))
             points_per_view = len(object_points[0]) * 2
@@ -328,9 +315,10 @@ class CameraCalibration:
 
         except Exception as e:
             print(f"Error during optimization: {str(e)}")
-            print(f"Initial params shape: {initial_params.shape}")
-            print(f"Initial params dtype: {initial_params.dtype}")
+            print(f"Last valid parameters: {initial_params}")
             raise
+
+
 
     def undistort_image(self, image: np.ndarray) -> np.ndarray:
         """
