@@ -185,9 +185,10 @@ class CameraCalibration:
         image_points = list(image_points)
 
         # Refine parameters using Zhang's method
-        return self.refine_parameters(object_points, image_points)
+        return self.refine_parameters(object_points, image_points, image_size)
 
-    def refine_parameters(self, object_points: List[np.ndarray], image_points: List[np.ndarray]) -> CalibrationResult:
+    def refine_parameters(self, object_points: List[np.ndarray], image_points: List[np.ndarray],
+                          image_size: Tuple[int, int]) -> CalibrationResult:
         """
         Refine calibration parameters with improved optimization settings.
         """
@@ -221,7 +222,8 @@ class CameraCalibration:
             return np.array(residuals, dtype=np.float64)
 
         # Get image dimensions from first image points
-        h, w = image_points[0].shape[1::-1]
+        w, h = image_size  # image_size is (width, height) from calibrate
+        # h, w = image_points[0].shape[1::-1]
 
         # Normalize current parameters to reasonable ranges
         fx = min(max(self.K[0, 0], 0.5 * w), 2.0 * w)
