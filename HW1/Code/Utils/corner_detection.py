@@ -193,6 +193,7 @@ class CameraCalibration:
         """
 
         def compute_residuals(params):
+            """Compute reprojection error for optimization."""
             K_new = np.array([[params[0], 0, params[2]],
                               [0, params[1], params[3]],
                               [0, 0, 1]], dtype=np.float64)
@@ -215,20 +216,23 @@ class CameraCalibration:
                     residuals.extend(error)
                 except Exception as e:
                     print(f"Warning: Error in projection for image {i}: {str(e)}")
-                    # Return large error to guide optimization away from invalid solutions
                     residuals.extend([1000.0] * (obj_pts.shape[0] * 2))
 
             return np.array(residuals, dtype=np.float64)
 
-        # Initialize with current estimates
-        initial_params = [
-            self.K[0, 0],  # fx
-            self.K[1, 1],  # fy
-            self.K[0, 2],  # cx
-            self.K[1, 2],  # cy
-            float(self.k[0, 0]),  # k1
-            float(self.k[1, 0])  # k2
-        ]
+        # Get image dimensions from first image points
+        h, w = image_points[0].shape[1::-1]
+
+        # Normalize current parameters to reasonable ranges
+        fx = min(max(self.K[0, 0], 0.5 * w), 2.0 * w)
+        fy = min(max(self.K[1, 1], 0.5 * h), 2.0 * h)
+        cx = min(max(self.K[0, 2], 0.4 * w), 0.6 * w)
+        cy = min(max(self.K[1, 2], 0.4 * h), 0.6 * h)
+        k1 = min(max(self.k[0, 0], -0.5), 0.5)
+        k2 = min(max(self.k[1, 0], -0.5), 0.5)
+
+        # Initialize with normalized parameters
+        initial_params = [fx, fy, cx, cy, k1, k2]
 
         # Add extrinsic parameters
         for R, t in zip(self.R, self.t):
@@ -238,24 +242,35 @@ class CameraCalibration:
 
         initial_params = np.array(initial_params, dtype=np.float64)
 
-        # Get image dimensions from first image points
-        h, w = image_points[0].shape[1::-1]
-
         # Set optimization bounds
-        lower_bounds = [-np.inf] * len(initial_params)
-        upper_bounds = [np.inf] * len(initial_params)
+        n_views = len(object_points)
+        n_params = 6 + 6 * n_views  # intrinsics + extrinsics for each view
 
-        # Constrain focal lengths to be positive and reasonable
-        lower_bounds[0:2] = [0.3 * max(w, h)] * 2
-        upper_bounds[0:2] = [3.0 * max(w, h)] * 2
+        lower_bounds = np.zeros(n_params)
+        upper_bounds = np.zeros(n_params)
 
-        # Constrain principal point to image center ± 20%
-        lower_bounds[2:4] = [0.4 * w, 0.4 * h]
+        # Intrinsic parameter bounds
+        lower_bounds[0:2] = [0.5 * w, 0.5 * h]  # fx, fy
+        upper_bounds[0:2] = [2.0 * w, 2.0 * h]
+
+        lower_bounds[2:4] = [0.4 * w, 0.4 * h]  # cx, cy
         upper_bounds[2:4] = [0.6 * w, 0.6 * h]
 
-        # Constrain distortion coefficients
-        lower_bounds[4:6] = [-0.5, -0.5]
+        lower_bounds[4:6] = [-0.5, -0.5]  # k1, k2
         upper_bounds[4:6] = [0.5, 0.5]
+
+        # Extrinsic parameter bounds (rotation and translation)
+        for i in range(6, n_params):
+            if (i - 6) % 6 < 3:  # rotation vector components
+                lower_bounds[i] = -2.0 * np.pi
+                upper_bounds[i] = 2.0 * np.pi
+            else:  # translation components
+                lower_bounds[i] = -10000.0
+                upper_bounds[i] = 10000.0
+
+        # Verify initial parameters are within bounds
+        for i in range(len(initial_params)):
+            initial_params[i] = np.clip(initial_params[i], lower_bounds[i], upper_bounds[i])
 
         try:
             # Run optimization
@@ -264,12 +279,16 @@ class CameraCalibration:
                 initial_params,
                 bounds=(lower_bounds, upper_bounds),
                 method='trf',
-                loss='huber',
-                ftol=1e-8,
-                xtol=1e-8,
-                max_nfev=200,
+                loss='soft_l1',
+                f_scale=0.1,
+                ftol=1e-4,
+                xtol=1e-4,
+                max_nfev=500,
                 verbose=1
             )
+
+            if not result.success:
+                print(f"Warning: Optimization did not converge: {result.message}")
 
             optimized_params = result.x
 
@@ -315,7 +334,9 @@ class CameraCalibration:
 
         except Exception as e:
             print(f"Error during optimization: {str(e)}")
-            print(f"Last valid parameters: {initial_params}")
+            print(f"Initial parameters shape: {initial_params.shape}")
+            print(f"Lower bounds shape: {lower_bounds.shape}")
+            print(f"Upper bounds shape: {upper_bounds.shape}")
             raise
 
 
