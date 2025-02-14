@@ -7,33 +7,31 @@ from dataclasses import dataclass
 
 @dataclass
 class CalibrationResult:
-    K: np.ndarray
-    k: np.ndarray
-    R: List[np.ndarray]
-    t: List[np.ndarray]
-    reprojection_error: float
-    per_view_errors: List[float]
+    """Store calibration results."""
+    K: np.ndarray  # Camera intrinsic matrix
+    k: np.ndarray  # Distortion coefficients
+    R: List[np.ndarray]  # Rotation matrices for each view
+    t: List[np.ndarray]  # Translation vectors for each view
+    reprojection_error: float  # Overall reprojection error
+    per_view_errors: List[float]  # Reprojection error for each view
 
 
 class CameraCalibration:
     def __init__(self, square_size: float = 21.5):
+        """Initialize camera calibration with checkerboard square size."""
         self.square_size = square_size
-        self.K = None
-        # self.k = np.zeros(2)
-        # self.k = np.zeros((5, 1), dtype=np.float32)
-        self.k = np.array([0.0, 0.0], dtype=np.float32).reshape(-1, 1)  # Explicitly initialize k = [0, 0]T
-        self.R = []
-        self.t = []
+        self.K = None  # Camera intrinsic matrix
+        self.k = np.zeros((5, 1), dtype=np.float32)
+        self.R = []  # List of rotation matrices
+        self.t = []  # List of translation vectors
 
-    def find_corners(self, image: np.ndarray, pattern_size: Tuple[int, int] = (9, 6)) -> Tuple[Optional[np.ndarray], bool]:
-        """ Detect checkerboard corners dynamically with a given pattern size. """
+    def find_corners(self, image: np.ndarray, pattern_size: Tuple[int, int] = (9, 6)) -> Tuple[
+        Optional[np.ndarray], bool]:
+        """Detect checkerboard corners in an image."""
         gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY) if len(image.shape) == 3 else image.copy()
-
-        # Preprocess for better detection
         gray = cv2.normalize(gray, None, 0, 255, cv2.NORM_MINMAX)
         gray = cv2.GaussianBlur(gray, (5, 5), 0)
 
-        # Find corners dynamically
         ret, corners = cv2.findChessboardCorners(
             gray, pattern_size,
             flags=(cv2.CALIB_CB_ADAPTIVE_THRESH +
@@ -42,189 +40,306 @@ class CameraCalibration:
         )
 
         if ret and corners is not None:
-            # Refine corners
             criteria = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 30, 0.001)
             corners = cv2.cornerSubPix(gray, corners, (11, 11), (-1, -1), criteria)
             return corners, True
         return None, False
-    # def find_corners(self, image: np.ndarray) -> Tuple[Optional[np.ndarray], bool]:
-    #     gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY) if len(image.shape) == 3 else image.copy()
-    #
-    #     # Preprocess for better detection
-    #     gray = cv2.normalize(gray, None, 0, 255, cv2.NORM_MINMAX)
-    #     gray = cv2.GaussianBlur(gray, (5, 5), 0)
-    #
-    #     # Find corners (6x7 inner corners)
-    #     pattern_size = (9, 6)  # width x height of inner corners
-    #     ret, corners = cv2.findChessboardCorners(
-    #         gray, pattern_size,
-    #         flags=(cv2.CALIB_CB_ADAPTIVE_THRESH +
-    #                cv2.CALIB_CB_NORMALIZE_IMAGE +
-    #                cv2.CALIB_CB_FILTER_QUADS)
-    #     )
-    #
-    #     if ret and corners is not None:
-    #         # Refine corners
-    #         criteria = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 30, 0.001)
-    #         corners = cv2.cornerSubPix(gray, corners, (11, 11), (-1, -1), criteria)
-    #         return corners, True
-    #     return None, False
 
     def create_object_points(self, pattern_size: Tuple[int, int]) -> np.ndarray:
-        """ Generate 3D object points assuming Z = 0 (checkerboard pattern) dynamically. """
-        objp = np.zeros((pattern_size[0] * pattern_size[1], 3), np.float32)
-        objp[:, :2] = np.mgrid[0:pattern_size[0], 0:pattern_size[1]].T.reshape(-1, 2)
+        """Generate 3D object points for the checkerboard pattern."""
+        objp = np.zeros((pattern_size[0] * pattern_size[1], 3), dtype=np.float32)
+        mgrid = np.mgrid[0:pattern_size[0], 0:pattern_size[1]].T
+        objp[:, :2] = mgrid.reshape(-1, 2)
         objp *= self.square_size
-        return objp
-    # def create_object_points(self) -> np.ndarray:
-    #     # objp = np.zeros((6 * 7, 3), np.float32)
-    #     # objp[:, :2] = np.mgrid[0:6, 0:7].T.reshape(-1, 2)
-    #     objp = np.zeros((9 * 6, 3), np.float32)  # Adjusted for correct pattern size
-    #     objp[:, :2] = np.mgrid[0:9, 0:6].T.reshape(-1, 2)
-    #     objp *= self.square_size
-    #     return objp
-    def calibrate(self, images: List[np.ndarray], pattern_size: Tuple[int, int] = (9, 6)):
-        """ Perform initial calibration using Zhang's method. """
-        object_points = []
-        image_points = []
+        return np.ascontiguousarray(objp, dtype=np.float32)
+
+    def estimate_homography(self, obj_points: np.ndarray, img_points: np.ndarray) -> np.ndarray:
+        """Estimate homography matrix using Zhang's method with normalization."""
+        obj_mean = np.mean(obj_points[:, :2], axis=0)
+        img_mean = np.mean(img_points, axis=0)
+        obj_std = np.std(obj_points[:, :2])
+        img_std = np.std(img_points)
+
+        norm_obj = (obj_points[:, :2] - obj_mean) / obj_std
+        norm_img = (img_points - img_mean) / img_std
+
+        n = len(obj_points)
+        A = np.zeros((2 * n, 9))
+        for i in range(n):
+            X, Y = norm_obj[i]
+            u, v = norm_img[i]
+            A[2 * i] = [-X, -Y, -1, 0, 0, 0, X * u, Y * u, u]
+            A[2 * i + 1] = [0, 0, 0, -X, -Y, -1, X * v, Y * v, v]
+
+        _, _, Vh = np.linalg.svd(A)
+        H = Vh[-1].reshape(3, 3)
+
+        T_obj = np.array([[1 / obj_std, 0, -obj_mean[0] / obj_std],
+                          [0, 1 / obj_std, -obj_mean[1] / obj_std],
+                          [0, 0, 1]])
+        T_img = np.array([[1 / img_std, 0, -img_mean[0] / img_std],
+                          [0, 1 / img_std, -img_mean[1] / img_std],
+                          [0, 0, 1]])
+
+        H = np.linalg.inv(T_img) @ H @ T_obj
+        return H / H[2, 2]
+
+    def _zhang_closed_form(self, homographies: List[np.ndarray], image_size: Tuple[int, int]):
+        """Implement Zhang's closed-form solution for K initialization."""
+        V = []
+        for H in homographies:
+            h1, h2, h3 = H.T
+            v11 = self._compute_v(h1, h1)
+            v12 = self._compute_v(h1, h2)
+            v22 = self._compute_v(h2, h2)
+            V.append(v12)
+            V.append(v11 - v22)
+
+        V = np.array(V)
+        _, _, Vh = np.linalg.svd(V)
+        b = Vh[-1]
+
+        B = np.array([
+            [b[0], b[1], b[3]],
+            [b[1], b[2], b[4]],
+            [b[3], b[4], b[5]]
+        ])
+
+        try:
+            v0 = (B[0, 1] * B[0, 2] - B[0, 0] * B[1, 2]) / (B[0, 0] * B[1, 1] - B[0, 1] ** 2)
+            lam = B[2, 2] - (B[0, 2] ** 2 + v0 * (B[0, 1] * B[0, 2] - B[0, 0] * B[1, 2])) / B[0, 0]
+            fx = np.sqrt(lam / B[0, 0])
+            fy = np.sqrt(lam * B[0, 0] / (B[0, 0] * B[1, 1] - B[0, 1] ** 2))
+            gamma = -B[0, 1] * fx ** 2 * fy / lam
+            u0 = gamma * v0 / fy - B[0, 2] * fx ** 2 / lam
+            v0 = v0 if not np.isnan(v0) else image_size[1] / 2
+            u0 = u0 if not np.isnan(u0) else image_size[0] / 2
+        except:
+            fx = fy = (image_size[0] + image_size[1]) / 2
+            gamma = 0
+            u0, v0 = image_size[0] / 2, image_size[1] / 2
+
+        self.K = np.array([[fx, gamma, u0],
+                           [0, fy, v0],
+                           [0, 0, 1]], dtype=np.float64)
+
+    def _compute_v(self, h1, h2):
+        return np.array([
+            h1[0] * h2[0],
+            h1[0] * h2[1] + h1[1] * h2[0],
+            h1[1] * h2[1],
+            h1[2] * h2[0] + h1[0] * h2[2],
+            h1[2] * h2[1] + h1[1] * h2[2],
+            h1[2] * h2[2]
+        ])
+
+    def calibrate(self, images: List[np.ndarray], pattern_size: Tuple[int, int] = (9, 6)) -> CalibrationResult:
+        """Perform calibration using Zhang's method with proper initialization."""
         objp = self.create_object_points(pattern_size)
+        image_points = []
+        homographies = []
 
         for img in images:
             corners, found = self.find_corners(img, pattern_size)
             if found:
-                object_points.append(objp)
-                image_points.append(corners)
+                H = self.estimate_homography(objp, corners.squeeze())
+                homographies.append(H)
+                image_points.append(corners.astype(np.float32))
 
-        if len(object_points) < 2:
-            raise ValueError("At least 2 valid calibration images required")
+        if len(homographies) < 2:
+            raise ValueError("At least 2 valid images required")
 
-        ret, K, k, rvecs, tvecs = cv2.calibrateCamera(
-            object_points, image_points, (images[0].shape[1], images[0].shape[0]), None, None,
-            flags=cv2.CALIB_RATIONAL_MODEL)
+        h, w = images[0].shape[:2]
+        self._zhang_closed_form(homographies, (w, h))
 
-        self.K = K
-        self.k = k.flatten().reshape(-1, 1)
-        self.R = [cv2.Rodrigues(r)[0] for r in rvecs]
-        self.t = tvecs
+        # Initialize distortion coefficients to zero
+        self.k = np.zeros((5, 1), dtype=np.float64)
 
-        return self.refine_parameters(object_points, image_points)
+        # Convert OpenCV format to our parameter structure
+        self.R, self.t = [], []
+        for H in homographies:
+            h1, h2, h3 = H.T
+            lam = 1 / np.linalg.norm(np.linalg.inv(self.K) @ h1)
+            r1 = lam * np.linalg.inv(self.K) @ h1
+            r2 = lam * np.linalg.inv(self.K) @ h2
+            r3 = np.cross(r1, r2)
+            R = np.vstack([r1, r2, r3]).T
+            U, _, Vt = np.linalg.svd(R)
+            R = U @ Vt
+            t = lam * np.linalg.inv(self.K) @ h3
+            self.R.append(R)
+            self.t.append(t)
 
-    def reprojection_error(self, params, object_points, image_points, image_size):
-        """ Compute the reprojection error. """
+        return self.refine_parameters([objp] * len(image_points), image_points, (w, h))
 
-        fx, fy, cx, cy, k1, k2 = params[:6]
-        rvecs = np.array(params[6:9], dtype=np.float64).reshape(3, 1)  # Ensure (3,1) shape
-        tvecs = np.array(params[9:12], dtype=np.float64).reshape(3, 1)  # Ensure (3,1) shape
+    def refine_parameters(self, object_points: List[np.ndarray], image_points: List[np.ndarray],
+                          image_size: Tuple[int, int]) -> CalibrationResult:
+        """Refine parameters with proper bounds and parameterization."""
+        w, h = image_size
 
-        # Ensure K is (3,3) and float64
-        K = np.array([[fx, 0, cx], [0, fy, cy], [0, 0, 1]], dtype=np.float64)
+        def compute_residuals(params):
+            K = np.array([
+                [params[0], params[1], params[3]],  # fx, gamma, cx
+                [0, params[2], params[4]],  # fy, cy
+                [0, 0, 1]
+            ], dtype=np.float64)
 
-        # Ensure k is (5,1) and float64, filling missing values with 0
-        k = np.zeros((5, 1), dtype=np.float64)
-        k[:2] = np.array([k1, k2]).reshape(-1, 1)  # Fill only the first two values
+            k = np.array([params[5], params[6], 0, 0, 0], dtype=np.float64)
+            residuals = []
+            idx = 7  # Start of extrinsic parameters
 
-        # Ensure object_points is (N,1,3) and float64
-        object_points = np.array(object_points, dtype=np.float64).reshape(-1, 1, 3)
+            for i in range(len(object_points)):
+                rvec = params[idx:idx + 3]
+                tvec = params[idx + 3:idx + 6]
+                idx += 6
 
-        # Project 3D points to 2D
-        projected_points, _ = cv2.projectPoints(object_points, rvecs, tvecs, K, k)
-        projected_points = projected_points.reshape(-1, 2)
+                proj, _ = cv2.projectPoints(object_points[i], rvec, tvec, K, k)
+                error = (image_points[i].reshape(-1, 2) - proj.reshape(-1, 2)).ravel()
+                residuals.extend(error.tolist())
 
-        # Compute error
-        error = image_points.reshape(-1, 2) - projected_points
-        return error.flatten()
+            return np.array(residuals, dtype=np.float64)
 
-    def refine_parameters(self, object_points, image_points):
-        """ Refine camera parameters using scipy.optimize. """
-        initial_params = np.hstack([
-            self.K[0, 0], self.K[1, 1], self.K[0, 2], self.K[1, 2], self.k[0, 0], self.k[1, 0],
-            cv2.Rodrigues(self.R[0])[0].flatten(), self.t[0].flatten()
-        ])
+        # Initial parameters [fx, gamma, fy, cx, cy, k1, k2]
+        initial_params = [
+            self.K[0, 0], self.K[0, 1], self.K[1, 1],  # fx, gamma, fy
+            self.K[0, 2], self.K[1, 2],  # cx, cy
+            0.0, 0.0  # k1, k2
+        ]
 
-        optimized = least_squares(
-            self.reprojection_error, initial_params, method="lm",
-            args=(object_points[0], image_points[0], (self.K.shape[1], self.K.shape[0]))
+        # Add extrinsics
+        for R, t in zip(self.R, self.t):
+            rvec, _ = cv2.Rodrigues(R)
+            initial_params.extend(rvec.ravel())
+            initial_params.extend(t.ravel())
+
+        # Set bounds
+        n_params = 7 + 6 * len(object_points)
+        lb = np.full(n_params, -np.inf)
+        ub = np.full(n_params, np.inf)
+
+        # Intrinsic bounds
+        lb[0:3] = [0.5 * w, -100, 0.5 * h]  # fx, gamma, fy
+        ub[0:3] = [2.0 * w, 100, 2.0 * h]
+        lb[3:5] = [0.4 * w, 0.4 * h]  # cx, cy
+        ub[3:5] = [0.6 * w, 0.6 * h]
+        lb[5:7] = [-2.0, -2.0]  # k1, k2
+        ub[5:7] = [2.0, 2.0]
+
+        # Optimize
+        result = least_squares(
+            compute_residuals,
+            np.array(initial_params),
+            bounds=(lb, ub),
+            method='trf',
+            loss='soft_l1',
+            ftol=1e-4,
+            xtol=1e-4,
+            max_nfev=600,
+            verbose=1
         )
 
-        optimized_params = optimized.x
-        self.K = np.array([[optimized_params[0], 0, optimized_params[2]],
-                           [0, optimized_params[1], optimized_params[3]],
-                           [0, 0, 1]])
+        # Extract results
+        self.K = np.array([
+            [result.x[0], result.x[1], result.x[3]],
+            [0, result.x[2], result.x[4]],
+            [0, 0, 1]
+        ])
+        self.k = np.array([result.x[5], result.x[6], 0, 0, 0])
 
-        self.k = np.array([optimized_params[4], optimized_params[5]]).reshape(-1, 1)
+        # Calculate errors
+        residuals = compute_residuals(result.x)
+        total_error = np.sqrt(np.mean(residuals ** 2))
+        per_view = [np.sqrt(np.mean(chunk ** 2))
+                    for chunk in np.array_split(residuals, len(object_points))]
 
-        R, _ = cv2.Rodrigues(np.array(optimized_params[6:9]))
-        self.R[0] = R
-        # self.t[0] = np.array(optimized_params[9:12]).reshape(3, 1)
-        self.t = (self.t[0], np.array(optimized_params[9:12]).reshape(3, 1))
-
-    def save_rectified_image(self, image: np.ndarray, object_points, output_path="rectified_reprojected.png"):
-        """ Save rectified image with reprojected corners. """
-        projected_points, _ = cv2.projectPoints(object_points, cv2.Rodrigues(self.R[0])[0], self.t[0], self.K, self.k)
-        projected_points = projected_points.reshape(-1, 2)
-
-        for point in projected_points:
-            cv2.circle(image, tuple(point.astype(int)), 5, (0, 0, 255), -1)
-
-        cv2.imwrite(output_path, image)
-    # def calibrate(self, images: List[np.ndarray]) -> CalibrationResult:
-    #     object_points = []
-    #     image_points = []
-    #     objp = self.create_object_points()
-    #
-    #     for img in images:
-    #         corners, found = self.find_corners(img)
-    #         if found:
-    #             object_points.append(objp)
-    #             image_points.append(corners)
-    #
-    #     if len(object_points) < 2:
-    #         raise ValueError("At least 2 valid calibration images required")
-    #
-    #     # Initial calibration
-    #     ret, mtx, dist, rvecs, tvecs = cv2.calibrateCamera(
-    #         object_points, image_points, (images[0].shape[1], images[0].shape[0]), None, None,  # images[0].shape[::-1]
-    #         flags=cv2.CALIB_RATIONAL_MODEL)
-    #
-    #     # Refine with optimization
-    #     self.K = mtx
-    #     # self.k = dist[:2]
-    #     self.k = dist.flatten()  # Ensure 1D array of all coefficients
-    #     self.R = [cv2.Rodrigues(r)[0] for r in rvecs]
-    #     self.t = tvecs
-    #
-    #     # Calculate reprojection error
-    #     total_error = 0
-    #     per_view_errors = []
-    #     for i in range(len(object_points)):
-    #         imgpoints2, _ = cv2.projectPoints(
-    #             object_points[i], rvecs[i], tvecs[i], mtx, dist)
-    #        # error = cv2.norm(image_points[i], imgpoints2.reshape(-1, 2))
-    #         error = cv2.norm(image_points[i].reshape(-1, 2).astype(np.float32),
-    #                          imgpoints2.reshape(-1, 2).astype(np.float32))
-    #
-    #         per_view_errors.append(error)
-    #         total_error += error
-    #
-    #     return CalibrationResult(
-    #         K=self.K.copy(),
-    #         k=self.k.copy(),
-    #         R=[R.copy() for R in self.R],
-    #         t=[t.copy() for t in self.t],
-    #         reprojection_error=total_error / len(object_points),
-    #         per_view_errors=per_view_errors
-    #     )
+        return CalibrationResult(
+            K=self.K.copy(),
+            k=self.k.copy(),
+            R=[R.copy() for R in self.R],
+            t=[t.copy() for t in self.t],
+            reprojection_error=total_error,
+            per_view_errors=per_view
+        )
 
     def undistort_image(self, image: np.ndarray) -> np.ndarray:
+        """
+        Remove lens distortion from an image.
+
+        Args:
+            image: Input distorted image
+
+        Returns:
+            Undistorted image
+        """
         h, w = image.shape[:2]
-        # Use self.k directly (already has correct coefficients)
-        # newcameramtx, roi = cv2.getOptimalNewCameraMatrix(self.K, self.k, (w, h), 1, (w, h))
-        # Ensure self.k is a (1, 5) numpy array
-        self.k = np.array(self.k, dtype=np.float64).reshape(1, -1)
-
-        # Now call OpenCV function
         newcameramtx, roi = cv2.getOptimalNewCameraMatrix(self.K, self.k, (w, h), 1, (w, h))
-
         dst = cv2.undistort(image, self.K, self.k, None, newcameramtx)
         x, y, w, h = roi
         return dst[y:y + h, x:x + w]
+
+    def save_rectified_image(self, image: np.ndarray, object_points: np.ndarray, corners: np.ndarray, index:int,
+                             output_path: str = "rectified_reprojected.png") -> None:
+        """
+        Save rectified image with detected and reprojected corners visualization.
+
+        Args:
+            image: Input image
+            object_points: 3D object points
+            corners: Detected corner points
+            output_path: Path to save the visualization
+        """
+        # First undistort the image
+        h, w = image.shape[:2]
+        newcameramtx, roi = cv2.getOptimalNewCameraMatrix(self.K, self.k, (w, h), 1, (w, h))
+        undist = cv2.undistort(image, self.K, self.k, None, newcameramtx)
+
+        # Make visualization image (copy of undistorted image)
+        vis_img = undist.copy()
+
+        R = self.R[index]
+        t = self.t[index]
+
+        # Existing projection code
+        projected_points, _ = cv2.projectPoints(object_points,
+                                                cv2.Rodrigues(R)[0],
+                                                t,
+                                                self.K,
+                                                self.k)
+
+        # Draw detected corners in red
+        for corner in corners:
+            point = tuple(corner.ravel().astype(int))
+            cv2.circle(vis_img, point, 10, (0, 0, 255), -1)  # Red circles
+
+        # Draw reprojected points in green
+        for point in projected_points:
+            point = tuple(point.ravel().astype(int))
+            cv2.circle(vis_img, point, 5, (0, 255, 0), -1)  # Green circles
+
+        # Add legend
+        legend_height = 60
+        legend = np.full((legend_height, w, 3), 255, dtype=np.uint8)
+
+        # Add legend text and samples
+        cv2.circle(legend, (30, 20), 5, (0, 0, 255), -1)
+        cv2.putText(legend, "Detected Corners", (50, 25),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 0), 2)
+
+        cv2.circle(legend, (30, 45), 5, (0, 255, 0), -1)
+        cv2.putText(legend, "Reprojected Points", (50, 50),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 0), 2)
+
+        # Combine visualization and legend
+        final_img = np.vstack((vis_img, legend))
+
+        # Add error information
+        error = np.mean(np.linalg.norm(corners - projected_points, axis=2))
+        cv2.putText(final_img, f"Reprojection Error: {error:.3f} pixels",
+                    (w - 300, h + 45), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 0), 2)
+
+        # Save the final visualization
+        cv2.imwrite(output_path, final_img)
+
+        # Optional: Also save undistorted image without visualization
+        undist_path = output_path.replace('.png', '_undistorted.png')
+        cv2.imwrite(undist_path, undist)

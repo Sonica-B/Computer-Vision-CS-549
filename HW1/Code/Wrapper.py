@@ -1,8 +1,8 @@
 import argparse
 import logging
 from pathlib import Path
-#from autocalib import *
-from Utils.corner_detection import *
+from autocalib import *
+
 
 # class CalibrationWrapper:
 #     def __init__(self, image_dir: str, output_dir: str, square_size: float = 21.5):
