@@ -176,7 +176,8 @@ class CalibrationWrapper:
                     img,
                     objp,
                     corners,
-                    str(debug_dir / f'calibration_result_{i:02d}.png')
+                    index=i,
+                    output_path=str(debug_dir / f'calibration_result_{i:02d}.png')
                 )
 
             # Save calibration parameters
