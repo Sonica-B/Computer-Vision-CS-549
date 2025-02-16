@@ -7,7 +7,7 @@ from dataclasses import dataclass
 
 @dataclass
 class CalibrationResult:
-    """Store calibration results."""
+
     K: np.ndarray  # Camera intrinsic matrix
     k: np.ndarray  # Distortion coefficients
     R: List[np.ndarray]  # Rotation matrices for each view
@@ -18,7 +18,7 @@ class CalibrationResult:
 
 class CameraCalibration:
     def __init__(self, square_size: float = 21.5):
-        """Initialize camera calibration with checkerboard square size."""
+
         self.square_size = square_size
         self.K = None  # Camera intrinsic matrix
         self.k = np.zeros((5, 1), dtype=np.float32)
@@ -27,7 +27,7 @@ class CameraCalibration:
 
     def find_corners(self, image: np.ndarray, pattern_size: Tuple[int, int] = (9, 6)) -> Tuple[
         Optional[np.ndarray], bool]:
-        """Detect checkerboard corners in an image."""
+
         gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY) if len(image.shape) == 3 else image.copy()
         gray = cv2.normalize(gray, None, 0, 255, cv2.NORM_MINMAX)
         gray = cv2.GaussianBlur(gray, (5, 5), 0)
@@ -46,7 +46,7 @@ class CameraCalibration:
         return None, False
 
     def create_object_points(self, pattern_size: Tuple[int, int]) -> np.ndarray:
-        """Generate 3D object points for the checkerboard pattern."""
+
         objp = np.zeros((pattern_size[0] * pattern_size[1], 3), dtype=np.float32)
         mgrid = np.mgrid[0:pattern_size[0], 0:pattern_size[1]].T
         objp[:, :2] = mgrid.reshape(-1, 2)
@@ -54,7 +54,7 @@ class CameraCalibration:
         return np.ascontiguousarray(objp, dtype=np.float32)
 
     def estimate_homography(self, obj_points: np.ndarray, img_points: np.ndarray) -> np.ndarray:
-        """Estimate homography matrix using Zhang's method with normalization."""
+
         obj_mean = np.mean(obj_points[:, :2], axis=0)
         img_mean = np.mean(img_points, axis=0)
         obj_std = np.std(obj_points[:, :2])
@@ -85,7 +85,7 @@ class CameraCalibration:
         return H / H[2, 2]
 
     def _zhang_closed_form(self, homographies: List[np.ndarray], image_size: Tuple[int, int]):
-        """Implement Zhang's closed-form solution for K initialization."""
+
         V = []
         for H in homographies:
             h1, h2, h3 = H.T
@@ -134,7 +134,7 @@ class CameraCalibration:
         ])
 
     def calibrate(self, images: List[np.ndarray], pattern_size: Tuple[int, int] = (9, 6)) -> CalibrationResult:
-        """Perform calibration using Zhang's method with proper initialization."""
+
         objp = self.create_object_points(pattern_size)
         image_points = []
         homographies = []
@@ -174,7 +174,7 @@ class CameraCalibration:
 
     def refine_parameters(self, object_points: List[np.ndarray], image_points: List[np.ndarray],
                           image_size: Tuple[int, int]) -> CalibrationResult:
-        """Refine parameters with proper bounds and parameterization."""
+
         w, h = image_size
 
         def compute_residuals(params):
@@ -262,15 +262,7 @@ class CameraCalibration:
         )
 
     def undistort_image(self, image: np.ndarray) -> np.ndarray:
-        """
-        Remove lens distortion from an image.
 
-        Args:
-            image: Input distorted image
-
-        Returns:
-            Undistorted image
-        """
         h, w = image.shape[:2]
         newcameramtx, roi = cv2.getOptimalNewCameraMatrix(self.K, self.k, (w, h), 1, (w, h))
         dst = cv2.undistort(image, self.K, self.k, None, newcameramtx)
@@ -279,15 +271,7 @@ class CameraCalibration:
 
     def save_rectified_image(self, image: np.ndarray, object_points: np.ndarray, corners: np.ndarray, index:int,
                              output_path: str = "rectified_reprojected.png") -> None:
-        """
-        Save rectified image with detected and reprojected corners visualization.
 
-        Args:
-            image: Input image
-            object_points: 3D object points
-            corners: Detected corner points
-            output_path: Path to save the visualization
-        """
         # First undistort the image
         h, w = image.shape[:2]
         newcameramtx, roi = cv2.getOptimalNewCameraMatrix(self.K, self.k, (w, h), 1, (w, h))
