@@ -1,5 +1,5 @@
 import numpy as np
-from LinearTriangulation import LinearTriangulation
+from .LinearTriangulation import LinearTriangulation
 
 
 def DisambiguateCameraPose(K, C_set, R_set, x1, x2):
@@ -49,5 +49,10 @@ def DisambiguateCameraPose(K, C_set, R_set, x1, x2):
             max_positive_depths = positive_depths
             best_config = i
             best_X = X
+
+
+        print(f"Best configuration had {max_positive_depths} points in front of both cameras")
+        if max_positive_depths < 10:
+            print("WARNING: Very few points passed cheirality check!")
 
     return C_set[best_config], R_set[best_config], best_X
