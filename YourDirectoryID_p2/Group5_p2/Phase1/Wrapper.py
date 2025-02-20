@@ -73,6 +73,7 @@ for key in tqdm(matches):
     su += np.shape(x)[0]
     F.append(estimate_fundamental_matrix(x, x_))
 
+
 print("2. Applying RANSAC for outlier rejection...")
 # Applying RANSAC algorithm
 F_inlier = []
@@ -83,6 +84,7 @@ for key in tqdm(matches):
     f, inl = InlierRANSAC(x, x_)
     F_inlier.append(f)
     inliers.append(inl)
+
 
 
 for idx, key in enumerate(matches):
@@ -142,14 +144,23 @@ for idx, key in enumerate(tqdm(matches)):
     x_inliers = x[inlier_indices]
     x__inliers = x_[inlier_indices]
 
+    # Normalize image points
+    x_inliers_norm = x_inliers / np.array([fx, fy])
+    x__inliers_norm = x__inliers / np.array([fx, fy])
+
     # Disambiguate camera pose
     C_best, R_best, X_initial = DisambiguateCameraPose(
         K,
         Camera_centers[idx],
         Camera_rotations[idx],
-        x_inliers,
-        x__inliers
+        x_inliers_norm,
+        x__inliers_norm
     )
+
+    # Scale the initial reconstruction
+    scale_factor = 1.0  # Adjust this based on your scene
+    X_initial = X_initial * scale_factor
+    C_best = C_best * scale_factor
 
     # Refine 3D points using non-linear optimization
     X_refined = NonlinearTriangulation(
@@ -167,53 +178,6 @@ for idx, key in enumerate(tqdm(matches)):
 
 
 # Visualize 3D reconstruction
-def plot_3d_reconstruction(points_3d, camera_poses):
-    fig = plt.figure(figsize=(10, 10))
-    ax = fig.add_subplot(111, projection='3d')
-
-    # Plot 3D points
-    all_points = []
-    for key in points_3d:
-        X = points_3d[key]
-        all_points.extend(X)
-        ax.scatter(X[:, 0], X[:, 1], X[:, 2], c='b', marker='.', s=1, label=f'Points from {key}')
-
-    # Plot camera positions
-    for cam_idx in camera_poses:
-        C, R = camera_poses[cam_idx]
-        ax.scatter(C[0], C[1], C[2], c='r', marker='o', s=100, label=f'Camera {cam_idx}')
-
-        # Plot camera orientation (coordinate axes)
-        scale = 0.5
-        for i, color in enumerate(['r', 'g', 'b']):
-            direction = R[:, i].reshape(3, 1)
-            ax.quiver(C[0], C[1], C[2],
-                      direction[0], direction[1], direction[2],
-                      length=scale, color=color)
-
-    # Set equal aspect ratio
-    all_points = np.array(all_points)
-    if len(all_points) > 0:
-        max_range = np.max([
-            np.max(all_points[:, 0]) - np.min(all_points[:, 0]),
-            np.max(all_points[:, 1]) - np.min(all_points[:, 1]),
-            np.max(all_points[:, 2]) - np.min(all_points[:, 2])
-        ])
-        mid_x = (np.max(all_points[:, 0]) + np.min(all_points[:, 0])) * 0.5
-        mid_y = (np.max(all_points[:, 1]) + np.min(all_points[:, 1])) * 0.5
-        mid_z = (np.max(all_points[:, 2]) + np.min(all_points[:, 2])) * 0.5
-        ax.set_xlim(mid_x - max_range * 0.5, mid_x + max_range * 0.5)
-        ax.set_ylim(mid_y - max_range * 0.5, mid_y + max_range * 0.5)
-        ax.set_zlim(mid_z - max_range * 0.5, mid_z + max_range * 0.5)
-
-    ax.set_xlabel('X')
-    ax.set_ylabel('Y')
-    ax.set_zlabel('Z')
-    plt.title('3D Reconstruction with Camera Poses')
-    plt.legend()
-    plt.show()
-
-
-# Plot the reconstruction
 print("6. Visualizing Results...")
-plot_3d_reconstruction(all_3D_points, final_camera_poses)
+plot_3d_points_and_cameras(all_3D_points, final_camera_poses,
+                          save_path="Phase1/Outputs/reconstruction_3d.png")

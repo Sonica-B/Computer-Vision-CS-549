@@ -48,3 +48,14 @@ def LinearTriangulation(K, C1, R1, C2, R2, x1, x2):
         X[i] = X_homogeneous[:3] / X_homogeneous[3]
 
     return X
+
+def normalize_points(points):
+    """Normalize points to have zero mean and unit std"""
+    mean = np.mean(points, axis=0)
+    std = np.std(points)
+    normalized_points = (points - mean) / std
+    return normalized_points, mean, std
+
+def denormalize_points(points, mean, std):
+    """Denormalize points back to original scale"""
+    return points * std + mean
